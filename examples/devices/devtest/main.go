@@ -1,4 +1,4 @@
-// Command devtest exercises /dev/gorev and /proc/gorev inside the QEMU VM
+// Command devtest exercises /dev/gorev, /dev/gopipe and /proc/gorev inside the QEMU VM
 // (test/qemu/run.sh with TEST_PROG=examples/devices/devtest).
 package main
 
@@ -23,6 +23,10 @@ func check(name string, err error) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "block-read" {
+		blockRead()
+		return
+	}
 	check("/dev/gorev exists, mode 0666", func() error {
 		fi, err := os.Stat("/dev/gorev")
 		if err != nil {
@@ -134,6 +138,8 @@ func main() {
 		}
 		return nil
 	}())
+
+	pipeTests()
 
 	if failed {
 		os.Exit(1)

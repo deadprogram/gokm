@@ -1,6 +1,7 @@
-// Command nettest exercises goecho0 inside the QEMU VM: configures the
-// interface with ioctls (no iproute2 in the VM), then pings it and sends UDP
-// echo traffic, including from many goroutines at once.
+// Command nettest exercises goecho0 and goeth0 inside the QEMU VM:
+// configures the interfaces with ioctls (no iproute2 in the VM), then pings
+// them and sends UDP echo traffic, including from many goroutines at once.
+// On goeth0 (Ethernet) the kernel must first resolve the peer with ARP.
 package main
 
 import (
@@ -30,6 +31,10 @@ const (
 	ifname = "goecho0"
 	local  = "10.99.0.1"
 	remote = "10.99.0.2"
+
+	ethName   = "goeth0"
+	ethLocal  = "10.99.1.1"
+	ethRemote = "10.99.1.2"
 )
 
 type ifreqAddr struct {
@@ -51,9 +56,9 @@ func ioctl(fd int, req uintptr, arg unsafe.Pointer) error {
 	return nil
 }
 
-func setAddr(fd int, req uintptr, ip string) error {
+func setAddr(fd int, req uintptr, name, ip string) error {
 	var r ifreqAddr
-	copy(r.Name[:], ifname)
+	copy(r.Name[:], name)
 	r.Addr.Family = syscall.AF_INET
 	copy(r.Addr.Addr[:], net.ParseIP(ip).To4())
 	return ioctl(fd, req, unsafe.Pointer(&r))
@@ -65,14 +70,18 @@ func configure() error {
 		return err
 	}
 	defer syscall.Close(fd)
-	if err := setAddr(fd, syscall.SIOCSIFADDR, local); err != nil {
+	if err := setAddr(fd, syscall.SIOCSIFADDR, ifname, local); err != nil {
 		return fmt.Errorf("SIOCSIFADDR: %w", err)
 	}
-	if err := setAddr(fd, syscall.SIOCSIFDSTADDR, remote); err != nil {
+	if err := setAddr(fd, syscall.SIOCSIFDSTADDR, ifname, remote); err != nil {
 		return fmt.Errorf("SIOCSIFDSTADDR: %w", err)
 	}
+	return up(fd, ifname)
+}
+
+func up(fd int, name string) error {
 	var f ifreqFlags
-	copy(f.Name[:], ifname)
+	copy(f.Name[:], name)
 	if err := ioctl(fd, syscall.SIOCGIFFLAGS, unsafe.Pointer(&f)); err != nil {
 		return fmt.Errorf("SIOCGIFFLAGS: %w", err)
 	}
@@ -83,7 +92,27 @@ func configure() error {
 	return nil
 }
 
-func ping(seq uint16) error {
+func readFile(p string) string {
+	b, _ := os.ReadFile(p)
+	return strings.TrimSpace(string(b))
+}
+
+func configureEth() error {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	if err := setAddr(fd, syscall.SIOCSIFADDR, ethName, ethLocal); err != nil {
+		return fmt.Errorf("SIOCSIFADDR: %w", err)
+	}
+	if err := setAddr(fd, syscall.SIOCSIFNETMASK, ethName, "255.255.255.0"); err != nil {
+		return fmt.Errorf("SIOCSIFNETMASK: %w", err)
+	}
+	return up(fd, ethName)
+}
+
+func ping(remote string, seq uint16) error {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
 	if err != nil {
 		return err
@@ -139,7 +168,7 @@ func checksum(b []byte) uint16 {
 	return ^uint16(sum)
 }
 
-func udpEcho(msg string) error {
+func udpEcho(remote, msg string) error {
 	c, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(remote), Port: 7})
 	if err != nil {
 		return err
@@ -161,17 +190,19 @@ func udpEcho(msg string) error {
 }
 
 func main() {
+	os.MkdirAll("/sys", 0o755)
+	syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
 	check("configure "+ifname, configure())
 	check("ping x3", func() error {
 		for i := uint16(1); i <= 3; i++ {
-			if err := ping(i); err != nil {
+			if err := ping(remote, i); err != nil {
 				return err
 			}
 		}
 		return nil
 	}())
-	check("UDP echo", udpEcho("hello from userspace"))
-	check("UDP echo 1400 bytes", udpEcho(strings.Repeat("x", 1400)))
+	check("UDP echo", udpEcho(remote, "hello from userspace"))
+	check("UDP echo 1400 bytes", udpEcho(remote, strings.Repeat("x", 1400)))
 	check("UDP echo: 16 goroutines x 50", func() error {
 		var wg sync.WaitGroup
 		errs := make(chan error, 16)
@@ -180,7 +211,7 @@ func main() {
 			go func(g int) {
 				defer wg.Done()
 				for i := 0; i < 50; i++ {
-					if err := udpEcho(fmt.Sprintf("g%d-i%d", g, i)); err != nil {
+					if err := udpEcho(remote, fmt.Sprintf("g%d-i%d", g, i)); err != nil {
 						errs <- err
 						return
 					}
@@ -223,13 +254,88 @@ func main() {
 		}
 		return nil
 	}())
+	check("configure "+ethName+" (Ethernet)", configureEth())
+	check(ethName+": type, MAC", func() error {
+		if t := readFile("/sys/class/net/goeth0/type"); t != "1" {
+			return fmt.Errorf("type %q, want 1 (ARPHRD_ETHER)", t)
+		}
+		if a := readFile("/sys/class/net/goeth0/address"); a != "02:00:00:00:00:01" {
+			return fmt.Errorf("address %q", a)
+		}
+		return nil
+	}())
+	check(ethName+": ping x3 (after ARP)", func() error {
+		for i := uint16(1); i <= 3; i++ {
+			if err := ping(ethRemote, i); err != nil {
+				return err
+			}
+		}
+		return nil
+	}())
+	check(ethName+": ARP entry for the peer", func() error {
+		arp := readFile("/proc/net/arp")
+		for _, line := range strings.Split(arp, "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 6 && f[0] == ethRemote && f[3] == "02:00:00:00:00:02" && f[5] == ethName {
+				return nil
+			}
+		}
+		return fmt.Errorf("no entry in /proc/net/arp:\n%s", arp)
+	}())
+	check(ethName+": UDP echo, 1400 bytes, 8 goroutines x 50", func() error {
+		if err := udpEcho(ethRemote, strings.Repeat("e", 1400)); err != nil {
+			return err
+		}
+		var wg sync.WaitGroup
+		errs := make(chan error, 8)
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				for i := 0; i < 50; i++ {
+					if err := udpEcho(ethRemote, fmt.Sprintf("eth g%d-i%d", g, i)); err != nil {
+						errs <- err
+						return
+					}
+				}
+			}(g)
+		}
+		wg.Wait()
+		close(errs)
+		return <-errs
+	}())
+	check(ethName+": MAC change is seen by the driver", func() error {
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+		if err != nil {
+			return err
+		}
+		defer syscall.Close(fd)
+		var r struct {
+			Name [16]byte
+			Addr syscall.RawSockaddr
+			_    [8]byte
+		}
+		copy(r.Name[:], ethName)
+		r.Addr.Family = 1 // ARPHRD_ETHER
+		for i, b := range []byte{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee} {
+			r.Addr.Data[i] = int8(b)
+		}
+		if err := ioctl(fd, syscall.SIOCSIFHWADDR, unsafe.Pointer(&r)); err != nil {
+			return fmt.Errorf("SIOCSIFHWADDR: %w", err)
+		}
+		if !strings.Contains(readFile("/proc/goecho"), "ethernet: goeth0 02:aa:bb:cc:dd:ee\n") {
+			return fmt.Errorf("driver doesn't see the new MAC:\n%s", readFile("/proc/goecho"))
+		}
+		return udpEcho(ethRemote, "after MAC change")
+	}())
 	check("/proc/goecho counters", func() error {
 		b, err := os.ReadFile("/proc/goecho")
 		if err != nil {
 			return err
 		}
 		fmt.Printf("nettest:      %s\n", strings.ReplaceAll(strings.TrimSpace(string(b)), "\n", ", "))
-		if !strings.Contains(string(b), "pings: 3\n") || !strings.Contains(string(b), "udp: 20802\n") ||
+		if !strings.Contains(string(b), "pings: 6\n") || !strings.Contains(string(b), "udp: 21204\n") ||
+			strings.Contains(string(b), "arp_replies: 0\n") ||
 			strings.Contains(string(b), "transmit_direct: 0\n") {
 			return fmt.Errorf("unexpected counters")
 		}

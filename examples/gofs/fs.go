@@ -13,6 +13,7 @@ var mu sync.Mutex
 
 // dir is a directory: entries in creation order.
 type dir struct {
+	xattrs
 	mode     fs.Mode
 	names    []string
 	children map[string]fs.Node
@@ -127,6 +128,7 @@ func (l *symlink) Readlink() (string, error) { return l.target, nil }
 
 // file is a regular file held in a Go byte slice.
 type file struct {
+	xattrs
 	mode fs.Mode
 	data []byte
 }
@@ -196,4 +198,49 @@ func (f *file) reserve(size int64) bool {
 	copy(nd, f.data)
 	f.data = nd
 	return true
+}
+
+// xattrs holds a node's extended attributes (fs.Xattrer), under mu.
+type xattrs struct {
+	attrs map[string][]byte
+}
+
+func (x *xattrs) GetXattr(name string) ([]byte, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	v, ok := x.attrs[name]
+	if !ok {
+		return nil, kernel.ENODATA
+	}
+	return v, nil
+}
+
+func (x *xattrs) SetXattr(name string, value []byte) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if x.attrs == nil {
+		x.attrs = map[string][]byte{}
+	}
+	x.attrs[name] = value
+	return nil
+}
+
+func (x *xattrs) RemoveXattr(name string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if _, ok := x.attrs[name]; !ok {
+		return kernel.ENODATA
+	}
+	delete(x.attrs, name)
+	return nil
+}
+
+func (x *xattrs) ListXattrs() ([]string, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	names := make([]string, 0, len(x.attrs))
+	for n := range x.attrs {
+		names = append(names, n)
+	}
+	return names, nil
 }

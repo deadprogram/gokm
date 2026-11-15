@@ -5,8 +5,10 @@
  * A blk-mq queue in blocking mode (BLK_MQ_F_BLOCKING): ->queue_rq runs in
  * process context (the block layer's workers or the submitter), so it can
  * enter Go, which may sleep and allocate. Each request's segments are
- * mapped and handed to Go one by one. The disk gets a dynamic device
- * number (no registered major), with room for partitions.
+ * mapped and handed to Go one by one. There is one hardware queue per CPU
+ * by default, so submitters on different CPUs don't share a queue. The
+ * disk gets a dynamic device number (no registered major), with room for
+ * partitions.
  */
 #include <linux/module.h>
 #include <linux/blkdev.h>
@@ -16,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/atomic.h>
+#include <linux/cpumask.h>
 
 #include "gokm.h"
 
@@ -26,7 +29,8 @@ long gokm_blk_go_discard(unsigned long h, s64 off, s64 n);
 
 /* Called from Go. */
 long gokm_blk_create(const char *name, s64 size, long lbs, long pbs, long max_io, u32 flags,
-		     unsigned long handle, unsigned long *out, char *out_name);
+		     long queues, long depth, unsigned long handle, unsigned long *out,
+		     char *out_name);
 void gokm_blk_destroy(unsigned long ptr);
 
 #define GOKM_BLK_RO		(1 << 0)
@@ -113,7 +117,8 @@ static const struct block_device_operations gokm_blk_fops = {
 };
 
 long gokm_blk_create(const char *name, s64 size, long lbs, long pbs, long max_io, u32 flags,
-		     unsigned long handle, unsigned long *out, char *out_name)
+		     long queues, long depth, unsigned long handle, unsigned long *out,
+		     char *out_name)
 {
 	struct queue_limits lim = {
 		.logical_block_size	= lbs,
@@ -140,8 +145,8 @@ long gokm_blk_create(const char *name, s64 size, long lbs, long pbs, long max_io
 	b->flush = flags & GOKM_BLK_FLUSH;
 
 	b->tag_set.ops = &gokm_blk_mq_ops;
-	b->tag_set.nr_hw_queues = 1;
-	b->tag_set.queue_depth = 128;
+	b->tag_set.nr_hw_queues = queues > 0 ? queues : num_online_cpus();
+	b->tag_set.queue_depth = depth > 0 ? depth : 128;
 	b->tag_set.numa_node = NUMA_NO_NODE;
 	b->tag_set.flags = BLK_MQ_F_BLOCKING;
 	err = blk_mq_alloc_tag_set(&b->tag_set);

@@ -58,6 +58,10 @@ func trunc(b []byte) string {
 func p(name string) string { return filepath.Join(mnt, name) }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "exec-probe" {
+		fmt.Println("exec-probe: running from " + os.Args[0])
+		return
+	}
 	os.MkdirAll(mnt, 0o755)
 	check("mount", syscall.Mount("none", mnt, "gofs", 0, ""))
 
@@ -318,6 +322,9 @@ func main() {
 		}
 		return os.RemoveAll(p("r3"))
 	}())
+
+	mmapTests()
+	xattrTests()
 
 	check("rmmod refused while mounted", expectErrno(deleteModule("gofs"), syscall.EWOULDBLOCK))
 

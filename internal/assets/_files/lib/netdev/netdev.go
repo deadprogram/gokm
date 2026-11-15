@@ -1,9 +1,12 @@
 // Package netdev creates network interfaces whose driver is Go code.
 //
-// The interfaces are point-to-point IP devices (no link-layer header, no
-// ARP), like a TUN device: Transmit gets each IPv4/IPv6 packet the kernel
-// routes out of the interface, and Receive injects packets into the kernel
-// as if they arrived on it.
+// By default interfaces are point-to-point IP devices (no link-layer
+// header, no ARP), like a TUN device: Transmit gets each IPv4/IPv6 packet
+// the kernel routes out of the interface, and Receive injects packets into
+// the kernel as if they arrived on it. With Ethernet set they are Ethernet
+// devices instead, like a TAP device: Transmit and Receive carry whole
+// frames (destination MAC, source MAC, EtherType, payload; no FCS), and
+// the kernel does ARP and IPv6 neighbor discovery over them.
 //
 //	type driver struct{ iface *netdev.Interface }
 //
@@ -58,6 +61,10 @@ type Interface struct {
 	// AtomicTransmit runs Transmit directly in the transmit path; see the
 	// package documentation.
 	AtomicTransmit bool
+	// Ethernet makes it an Ethernet device, with hardware address MAC
+	// (random if zero). MTU excludes the 14-byte header.
+	Ethernet bool
+	MAC      [6]byte
 
 	ptr    uintptr
 	handle kernel.Handle
@@ -66,7 +73,10 @@ type Interface struct {
 // Implemented in the netdev glue (gokm/frameworks/netdev/netdev.c).
 //
 //export gokm_netdev_create
-func cCreate(name *byte, mtu int, atomicXmit bool, handle uintptr, out *uintptr, outName *byte) int
+func cCreate(name *byte, mtu int, atomicXmit, ether bool, mac *byte, handle uintptr, out *uintptr, outName *byte) int
+
+//export gokm_netdev_mac
+func cMAC(ptr uintptr, mac *byte)
 
 //export gokm_netdev_stats
 func cStats(ptr uintptr, direct, deferred *uint64)
@@ -92,7 +102,8 @@ func Register(i *Interface) error {
 	i.handle = kernel.NewHandle(i)
 	name := i.Name + "\x00"
 	var assigned [16]byte
-	if rc := cCreate(unsafe.StringData(name), i.MTU, i.AtomicTransmit, uintptr(i.handle), &i.ptr, &assigned[0]); rc != 0 {
+	if rc := cCreate(unsafe.StringData(name), i.MTU, i.AtomicTransmit, i.Ethernet, &i.MAC[0],
+		uintptr(i.handle), &i.ptr, &assigned[0]); rc != 0 {
 		i.handle.Delete()
 		i.ptr = 0
 		return kernel.Errno(-rc)
@@ -103,12 +114,26 @@ func Register(i *Interface) error {
 			break
 		}
 	}
+	if i.Ethernet {
+		cMAC(i.ptr, &i.MAC[0])
+	}
 	kernel.OnExit(i.Unregister)
 	return nil
 }
 
-// Receive injects an IPv4 or IPv6 packet into the kernel as if it arrived
-// on the interface. The data is copied.
+// HardwareAddr returns the current MAC address of an Ethernet interface
+// (it can be changed with ip link set ... address). Process context only.
+func (i *Interface) HardwareAddr() [6]byte {
+	var mac [6]byte
+	if i.ptr != 0 && i.Ethernet {
+		cMAC(i.ptr, &mac[0])
+	}
+	return mac
+}
+
+// Receive injects an IPv4 or IPv6 packet (an Ethernet frame on Ethernet
+// interfaces) into the kernel as if it arrived on the interface. The data
+// is copied.
 func (i *Interface) Receive(pkt []byte) error {
 	if i.ptr == 0 {
 		return kernel.ENODEV

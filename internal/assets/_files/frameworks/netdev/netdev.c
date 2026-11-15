@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * gokm/netdev glue: point-to-point IP network devices driven by Go
- * (lib/netdev/netdev.go).
+ * gokm/netdev glue: network devices driven by Go (lib/netdev/netdev.go):
+ * point-to-point IP devices (like TUN) or Ethernet devices (like TAP: whole
+ * frames, ARP and neighbor discovery done by the kernel).
  *
  * ndo_start_xmit runs with BH disabled (atomic context). By default it
  * queues the packet and a work item hands queued packets to Go in process
@@ -17,6 +18,9 @@
 #include <linux/skbuff.h>
 #include <linux/if_arp.h>
 #include <linux/if_ether.h>
+#include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
+#include <linux/rtnetlink.h>
 #include <linux/workqueue.h>
 #include <linux/string.h>
 
@@ -30,8 +34,26 @@ long gokm_netdev_go_open(unsigned long h);
 long gokm_netdev_go_stop(unsigned long h);
 
 /* Called from Go. */
-long gokm_netdev_create(const char *name, long mtu, bool atomic_xmit,
-			unsigned long handle, unsigned long *out, char *out_name);
+long gokm_netdev_create(const char *name, long mtu, bool atomic_xmit, bool ether,
+			const u8 *mac, unsigned long handle, unsigned long *out, char *out_name);
+void gokm_netdev_mac(unsigned long ptr, u8 *mac);
+void gokm_netdev_mac(unsigned long ptr, u8 *mac)
+{
+	struct net_device *dev = (struct net_device *)ptr;
+
+	u8 addr[ETH_ALEN];
+
+	/* dev_addr changes under rtnl (ip link set address). */
+	{
+		GOKM_PARK();
+		rtnl_lock();
+		ether_addr_copy(addr, dev->dev_addr);
+		rtnl_unlock();
+		GOKM_UNPARK();
+	}
+	memcpy(mac, addr, ETH_ALEN);	/* Go memory: after unparking */
+}
+
 void gokm_netdev_stats(unsigned long ptr, u64 *direct, u64 *deferred);
 void gokm_netdev_destroy(unsigned long ptr);
 long gokm_netdev_rx(unsigned long ptr, const void *pkt, long len);
@@ -42,6 +64,7 @@ struct gokm_netdev_priv {
 	struct sk_buff_head txq;
 	struct work_struct tx_work;
 	bool atomic_xmit;
+	bool ether;
 	atomic64_t direct;	/* packets Go handled in the transmit path */
 	atomic64_t deferred;	/* packets handed to Go from the workqueue */
 };
@@ -127,6 +150,24 @@ static const struct net_device_ops gokm_netdev_ops = {
 	.ndo_start_xmit	= gokm_netdev_xmit,
 };
 
+static const struct net_device_ops gokm_netdev_ether_ops = {
+	.ndo_open		= gokm_netdev_open,
+	.ndo_stop		= gokm_netdev_stop,
+	.ndo_start_xmit		= gokm_netdev_xmit,
+	.ndo_set_mac_address	= eth_mac_addr,
+	.ndo_validate_addr	= eth_validate_addr,
+};
+
+static void gokm_netdev_ether_setup(struct net_device *dev)
+{
+	ether_setup(dev);
+	dev->netdev_ops = &gokm_netdev_ether_ops;
+	dev->min_mtu = ETH_MIN_MTU;
+	dev->max_mtu = ETH_MAX_MTU;
+	dev->priv_flags |= IFF_NO_QUEUE | IFF_LIVE_ADDR_CHANGE;
+	dev->tx_queue_len = 0;
+}
+
 static void gokm_netdev_setup(struct net_device *dev)
 {
 	dev->netdev_ops = &gokm_netdev_ops;
@@ -141,18 +182,30 @@ static void gokm_netdev_setup(struct net_device *dev)
 	dev->priv_flags |= IFF_NO_QUEUE;
 }
 
-long gokm_netdev_create(const char *name, long mtu, bool atomic_xmit,
-			unsigned long handle, unsigned long *out, char *out_name)
+long gokm_netdev_create(const char *name, long mtu, bool atomic_xmit, bool ether,
+			const u8 *mac, unsigned long handle, unsigned long *out, char *out_name)
 {
 	struct gokm_netdev_priv *p;
 	struct net_device *dev;
 	int err;
 
-	dev = alloc_netdev(sizeof(*p), name, NET_NAME_USER, gokm_netdev_setup);
+	dev = alloc_netdev(sizeof(*p), name, NET_NAME_USER,
+			   ether ? gokm_netdev_ether_setup : gokm_netdev_setup);
 	if (!dev)
 		return -ENOMEM;
 	dev->mtu = mtu;
+	if (ether) {
+		if (is_zero_ether_addr(mac)) {
+			eth_hw_addr_random(dev);
+		} else if (is_valid_ether_addr(mac)) {
+			eth_hw_addr_set(dev, mac);
+		} else {
+			free_netdev(dev);
+			return -EADDRNOTAVAIL;
+		}
+	}
 	p = netdev_priv(dev);
+	p->ether = ether;
 	p->dev = dev;
 	p->handle = handle;
 	p->atomic_xmit = atomic_xmit;
@@ -189,8 +242,25 @@ void gokm_netdev_destroy(unsigned long ptr)
 long gokm_netdev_rx(unsigned long ptr, const void *pkt, long len)
 {
 	struct net_device *dev = (struct net_device *)ptr;
+	struct gokm_netdev_priv *p = netdev_priv(dev);
 	struct sk_buff *skb;
 	u8 version;
+
+	if (p->ether) {
+		if (len < ETH_HLEN || len > dev->mtu + ETH_HLEN + VLAN_HLEN)
+			return -EINVAL;
+		skb = netdev_alloc_skb_ip_align(dev, len);
+		if (!skb) {
+			DEV_STATS_INC(dev, rx_dropped);
+			return -ENOMEM;
+		}
+		skb_put_data(skb, pkt, len);
+		skb->protocol = eth_type_trans(skb, dev);
+		DEV_STATS_INC(dev, rx_packets);
+		DEV_STATS_ADD(dev, rx_bytes, len);
+		netif_rx(skb);
+		return 0;
+	}
 
 	if (len <= 0 || len > dev->mtu)
 		return -EINVAL;

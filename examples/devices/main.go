@@ -5,6 +5,9 @@
 //
 // /dev/gorev also answers two ioctls: GOREV_CLEAR (_IO('g', 1)) clears the
 // message, GOREV_LEN (_IOR('g', 2, uint32)) returns its length.
+//
+// /dev/gopipe is a pipe (4 KiB): reads wait for data and writes for room,
+// unless O_NONBLOCK (EAGAIN), and it works with poll, select and epoll.
 package main
 
 import (
@@ -96,6 +99,66 @@ func (statsFile) Write(p []byte) error {
 	return nil
 }
 
+const pipeCap = 4096
+
+var (
+	pipeDev *chardev.Device
+	pipeMu  sync.Mutex
+	pipeBuf []byte // at most pipeCap bytes
+)
+
+type pipeFile struct{}
+
+func pipeLen() int {
+	pipeMu.Lock()
+	defer pipeMu.Unlock()
+	return len(pipeBuf)
+}
+
+func (pipeFile) ReadFlags(p []byte, off int64, fl chardev.Flags) (int, error) {
+	for {
+		if err := pipeDev.Wait(fl, func() bool { return pipeLen() > 0 }); err != nil {
+			return 0, err
+		}
+		pipeMu.Lock()
+		n := copy(p, pipeBuf)
+		pipeBuf = append(pipeBuf[:0], pipeBuf[n:]...)
+		pipeMu.Unlock()
+		if n > 0 {
+			pipeDev.Wake() // room for writers
+			return n, nil
+		}
+	}
+}
+
+func (pipeFile) WriteFlags(p []byte, off int64, fl chardev.Flags) (int, error) {
+	for {
+		if err := pipeDev.Wait(fl, func() bool { return pipeLen() < pipeCap }); err != nil {
+			return 0, err
+		}
+		pipeMu.Lock()
+		n := min(len(p), pipeCap-len(pipeBuf))
+		pipeBuf = append(pipeBuf, p[:n]...)
+		pipeMu.Unlock()
+		if n > 0 {
+			pipeDev.Wake() // data for readers
+			return n, nil
+		}
+	}
+}
+
+func (pipeFile) Poll() chardev.PollEvents {
+	var ev chardev.PollEvents
+	n := pipeLen()
+	if n > 0 {
+		ev |= chardev.PollIn
+	}
+	if n < pipeCap {
+		ev |= chardev.PollOut
+	}
+	return ev
+}
+
 func main() {
 	dev := &chardev.Device{
 		Name: "gorev",
@@ -111,10 +174,21 @@ func main() {
 		kernel.FailLoad(err)
 		return
 	}
-	if _, err := procfs.Create("gorev", statsFile{}); err != nil {
-		dev.Deregister() // exit hooks don't run when loading fails
+	pipeDev = &chardev.Device{
+		Name:   "gopipe",
+		Mode:   0o666,
+		Opener: chardev.OpenFunc(func() (chardev.File, error) { return pipeFile{}, nil }),
+	}
+	if err := chardev.Register(pipeDev); err != nil {
+		dev.Deregister()
 		kernel.FailLoad(err)
 		return
 	}
-	kernel.Print("created /dev/gorev and /proc/gorev")
+	if _, err := procfs.Create("gorev", statsFile{}); err != nil {
+		dev.Deregister() // exit hooks don't run when loading fails
+		pipeDev.Deregister()
+		kernel.FailLoad(err)
+		return
+	}
+	kernel.Print("created /dev/gorev, /dev/gopipe and /proc/gorev")
 }

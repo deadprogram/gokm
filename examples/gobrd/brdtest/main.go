@@ -97,6 +97,12 @@ func testSysfs() error {
 			return err
 		}
 	}
+	// One hardware queue per CPU.
+	queues, _ := filepath.Glob("/sys/block/gobrd0/mq/*")
+	cpus, _ := filepath.Glob("/sys/devices/system/cpu/cpu[0-9]*")
+	if len(queues) != len(cpus) || len(queues) < 2 {
+		return fmt.Errorf("%d hardware queues for %d CPUs", len(queues), len(cpus))
+	}
 	if _, err := os.Stat("/sys/block/gobrd2"); err == nil {
 		return fmt.Errorf("gobrd2 exists with rd_nr=2")
 	}

@@ -60,6 +60,10 @@ type Disk struct {
 	ReadOnly bool
 	// Rotational tells the kernel it's a spinning disk (default: an SSD).
 	Rotational bool
+	// Queues is the number of hardware queues (default: one per CPU), and
+	// QueueDepth the requests in flight per queue (default 128).
+	Queues     int
+	QueueDepth int
 	Device     Device
 
 	ptr    uintptr
@@ -69,8 +73,8 @@ type Disk struct {
 // Implemented in the blk glue (gokm/frameworks/blk/blk.c).
 //
 //export gokm_blk_create
-func cCreate(name *byte, size int64, lbs, pbs, maxIO int, flags uint32, handle uintptr,
-	out *uintptr, outName *byte) int
+func cCreate(name *byte, size int64, lbs, pbs, maxIO int, flags uint32, queues, depth int,
+	handle uintptr, out *uintptr, outName *byte) int
 
 //export gokm_blk_destroy
 func cDestroy(ptr uintptr)
@@ -103,7 +107,7 @@ func Register(d *Disk) error {
 	if d.MaxIO == 0 {
 		d.MaxIO = 256 << 10
 	}
-	if d.Size <= 0 || d.Size%int64(d.LogicalBlockSize) != 0 {
+	if d.Size <= 0 || d.Size%int64(d.LogicalBlockSize) != 0 || d.Queues < 0 || d.QueueDepth < 0 {
 		return kernel.EINVAL
 	}
 	var flags uint32
@@ -123,7 +127,7 @@ func Register(d *Disk) error {
 	name := d.Name + "\x00"
 	var assigned [32]byte
 	if rc := cCreate(unsafe.StringData(name), d.Size, d.LogicalBlockSize, d.PhysicalBlockSize,
-		d.MaxIO, flags, uintptr(d.handle), &d.ptr, &assigned[0]); rc != 0 {
+		d.MaxIO, flags, d.Queues, d.QueueDepth, uintptr(d.handle), &d.ptr, &assigned[0]); rc != 0 {
 		d.handle.Delete()
 		d.ptr = 0
 		return kernel.Errno(-rc)

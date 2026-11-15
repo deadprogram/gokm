@@ -125,6 +125,18 @@ type (
 	Unmounter interface {
 		Unmount()
 	}
+	// Xattrer stores a node's extended attributes (getfattr/setfattr):
+	// names come with their namespace prefix, "user." or "trusted." (the
+	// kernel checks permissions; trusted.* needs CAP_SYS_ADMIN). GetXattr
+	// and RemoveXattr return kernel.ENODATA for a missing name. SetXattr
+	// gets a copy of the value; the framework handles the create-only and
+	// replace-only flags. Without Xattrer, setting fails with EOPNOTSUPP.
+	Xattrer interface {
+		GetXattr(name string) ([]byte, error)
+		SetXattr(name string, value []byte) error
+		RemoveXattr(name string) error
+		ListXattrs() ([]string, error)
+	}
 )
 
 // FileSystem is a filesystem type.
@@ -594,4 +606,116 @@ func goIterate(h uintptr, dirIno uint64, start int64, ctx uintptr) (rc int) {
 		return cEmit(ctx, unsafe.StringData(name), len(name), m.ino(n), uint32(mode&ModeType)>>12)
 	})
 	return kernel.ToErrno(err)
+}
+
+// Extended attributes. Buffers are kernel memory, valid during the call.
+
+const (
+	xattrCreate  = 1 // XATTR_CREATE
+	xattrReplace = 2 // XATTR_REPLACE
+)
+
+func xattrer(h uintptr, ino uint64) (Xattrer, int) {
+	n, ok := getMount(h).node(ino)
+	if !ok {
+		return nil, -int(kernel.ENOENT)
+	}
+	x, ok := n.(Xattrer)
+	if !ok {
+		return nil, -int(kernel.EOPNOTSUPP)
+	}
+	return x, 0
+}
+
+// gokm_fs_go_getxattr copies the value into buf and returns its length;
+// with size 0 it only returns the length.
+//
+//export gokm_fs_go_getxattr
+func goGetxattr(h uintptr, ino uint64, name *byte, nameLen int, buf *byte, size int) (rc int) {
+	defer kernel.CatchPanic(&rc)
+	x, errno := xattrer(h, ino)
+	if errno != 0 {
+		if errno == -int(kernel.EOPNOTSUPP) {
+			return -int(kernel.ENODATA)
+		}
+		return errno
+	}
+	v, err := x.GetXattr(string(viewBytes(name, nameLen)))
+	if err != nil {
+		return kernel.ToErrno(err)
+	}
+	if size == 0 {
+		return len(v)
+	}
+	if len(v) > size {
+		return -int(kernel.ERANGE)
+	}
+	copy(viewBytes(buf, size), v)
+	return len(v)
+}
+
+//export gokm_fs_go_setxattr
+func goSetxattr(h uintptr, ino uint64, name *byte, nameLen int, value *byte, size int,
+	remove bool, flags int32) (rc int) {
+	defer kernel.CatchPanic(&rc)
+	x, errno := xattrer(h, ino)
+	if errno != 0 {
+		return errno
+	}
+	key := string(viewBytes(name, nameLen)) // a copy: implementations may keep it
+	if remove {
+		return kernel.ToErrno(x.RemoveXattr(key))
+	}
+	if flags&(xattrCreate|xattrReplace) != 0 {
+		_, err := x.GetXattr(key)
+		exists := err == nil
+		if err != nil && err != kernel.ENODATA {
+			return kernel.ToErrno(err)
+		}
+		if flags&xattrCreate != 0 && exists {
+			return -int(kernel.EEXIST)
+		}
+		if flags&xattrReplace != 0 && !exists {
+			return -int(kernel.ENODATA)
+		}
+	}
+	v := make([]byte, size)
+	copy(v, viewBytes(value, size))
+	return kernel.ToErrno(x.SetXattr(key, v))
+}
+
+// gokm_fs_go_listxattr writes the names, each NUL-terminated, into buf and
+// returns the total length (only the length when size is 0).
+//
+//export gokm_fs_go_listxattr
+func goListxattr(h uintptr, ino uint64, buf *byte, size int) (rc int) {
+	defer kernel.CatchPanic(&rc)
+	x, errno := xattrer(h, ino)
+	if errno != 0 {
+		if errno == -int(kernel.EOPNOTSUPP) {
+			return 0
+		}
+		return errno
+	}
+	names, err := x.ListXattrs()
+	if err != nil {
+		return kernel.ToErrno(err)
+	}
+	total := 0
+	for _, n := range names {
+		total += len(n) + 1
+	}
+	if size == 0 {
+		return total
+	}
+	if total > size {
+		return -int(kernel.ERANGE)
+	}
+	out := viewBytes(buf, size)
+	for _, n := range names {
+		copy(out, n)
+		out[len(n)] = 0
+		out = out[len(n)+1:]
+	}
+	return total
 }

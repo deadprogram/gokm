@@ -36,9 +36,9 @@ qemu: gokm
 	mkdir -p _qemu
 	$(call qemu_test,hello,examples/hello,,,"goodbye after")
 	$(call qemu_test,gcstress,examples/gcstress,-heap-size 256K,,"gcstress: OK" "list still intact at exit")
-	$(call qemu_test,gofs,examples/gofs,-heap-size 8M -heap-max 8M,TEST_PROG=examples/gofs/fstest,"fstest: ok   rename" "fstest: ok   symlinks" "fstest: ok   remount is a fresh")
-	$(call qemu_test,devices,examples/devices,,TEST_PROG=examples/devices/devtest,"devtest: ok   ioctls")
-	$(call qemu_test,gonet,examples/gonet,,TEST_PROG=examples/gonet/nettest,"nettest: ok   UDP flood" "nettest: ok   /proc/goecho counters")
+	$(call qemu_test,gofs,examples/gofs,-heap-size 8M -heap-max 16M,TEST_PROG=examples/gofs/fstest,"fstest: ok   rename" "fstest: ok   symlinks" "fstest: ok   remount is a fresh" "fstest: ok   run a binary stored in gofs" "fstest: ok   xattrs")
+	$(call qemu_test,devices,examples/devices,,TEST_PROG=examples/devices/devtest,"devtest: ok   ioctls" "devtest: ok   pipe: a blocked reader can be killed")
+	$(call qemu_test,gonet,examples/gonet,,TEST_PROG=examples/gonet/nettest,"nettest: ok   UDP flood" "nettest: ok   /proc/goecho counters" "nettest: ok   goeth0: ping")
 	$(call qemu_test,sysinfo,examples/sysinfo,,TEST_PROG=examples/sysinfo/infotest,"infotest: PASS")
 	$(call qemu_test,gobrd,examples/gobrd,,TEST_PROG=examples/gobrd/brdtest EXTRA_MODULES="drivers/block/brd.ko.zst fs/fat/fat.ko.zst fs/fat/vfat.ko.zst","brdtest: PASS" "unloaded. freed",rd_nr=2 rd_size=40960)
 	$(call qemu_test,failload,test/fixtures/failload,,EXPECT_LOAD_ERRNO=ENODEV,)

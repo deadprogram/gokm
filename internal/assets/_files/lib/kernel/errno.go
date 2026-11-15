@@ -8,44 +8,46 @@ import _ "unsafe" // for go:linkname
 type Errno int
 
 const (
-	EPERM        Errno = 1
-	ENOENT       Errno = 2
-	EIO          Errno = 5
-	ENXIO        Errno = 6
-	E2BIG        Errno = 7
-	EBADF        Errno = 9
-	EAGAIN       Errno = 11
-	ENOMEM       Errno = 12
-	EACCES       Errno = 13
-	EFAULT       Errno = 14
-	EBUSY        Errno = 16
-	EEXIST       Errno = 17
-	EXDEV        Errno = 18
-	ENODEV       Errno = 19
-	ENOTDIR      Errno = 20
-	EISDIR       Errno = 21
-	EINVAL       Errno = 22
-	ENFILE       Errno = 23
-	EMFILE       Errno = 24
-	ENOTTY       Errno = 25
-	EFBIG        Errno = 27
-	ENOSPC       Errno = 28
-	ESPIPE       Errno = 29
-	EROFS        Errno = 30
-	EMLINK       Errno = 31
-	ERANGE       Errno = 34
-	ENAMETOOLONG Errno = 36
-	ENOSYS       Errno = 38
-	ENOTEMPTY    Errno = 39
-	ENODATA      Errno = 61
-	EOVERFLOW    Errno = 75
-	EOPNOTSUPP   Errno = 95
-	ETIMEDOUT    Errno = 110
+	EPERM         Errno = 1
+	ENOENT        Errno = 2
+	EINTR         Errno = 4
+	EIO           Errno = 5
+	ENXIO         Errno = 6
+	E2BIG         Errno = 7
+	EBADF         Errno = 9
+	EAGAIN        Errno = 11
+	ENOMEM        Errno = 12
+	EACCES        Errno = 13
+	EFAULT        Errno = 14
+	EBUSY         Errno = 16
+	EEXIST        Errno = 17
+	EXDEV         Errno = 18
+	ENODEV        Errno = 19
+	ENOTDIR       Errno = 20
+	EISDIR        Errno = 21
+	EINVAL        Errno = 22
+	ENFILE        Errno = 23
+	EMFILE        Errno = 24
+	ENOTTY        Errno = 25
+	EFBIG         Errno = 27
+	ENOSPC        Errno = 28
+	ESPIPE        Errno = 29
+	EROFS         Errno = 30
+	EMLINK        Errno = 31
+	ERANGE        Errno = 34
+	ENAMETOOLONG  Errno = 36
+	ENOSYS        Errno = 38
+	ENOTEMPTY     Errno = 39
+	ENODATA       Errno = 61
+	EOVERFLOW     Errno = 75
+	EOPNOTSUPP    Errno = 95
+	EADDRNOTAVAIL Errno = 99
+	ETIMEDOUT     Errno = 110
 )
 
 var errnoNames = map[Errno]string{
 	EPERM: "EPERM", ENOENT: "ENOENT", EIO: "EIO", ENXIO: "ENXIO", E2BIG: "E2BIG",
-	EBADF: "EBADF", EAGAIN: "EAGAIN", ENOMEM: "ENOMEM", EACCES: "EACCES",
+	EINTR: "EINTR", EBADF: "EBADF", EAGAIN: "EAGAIN", ENOMEM: "ENOMEM", EACCES: "EACCES",
 	EFAULT: "EFAULT", EBUSY: "EBUSY", EEXIST: "EEXIST", EXDEV: "EXDEV",
 	ENODEV: "ENODEV", ENOTDIR: "ENOTDIR", EISDIR: "EISDIR", EINVAL: "EINVAL",
 	ENFILE: "ENFILE", EMFILE: "EMFILE", ENOTTY: "ENOTTY", EFBIG: "EFBIG",

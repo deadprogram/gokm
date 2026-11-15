@@ -66,10 +66,10 @@ Everything except the final `.ko` goes into `~/.cache/gokm` (or `$GOKMCACHE`).
 | Package        | What it's for                                                          |
 |----------------|------------------------------------------------------------------------|
 | `gokm/kernel`  | logging, module lifecycle, errors, handles, memory, `SpinLock`         |
-| `gokm/fs`      | filesystems: implement `Dir` / file interfaces, `fs.Register`          |
-| `gokm/chardev` | character devices (`/dev/<name>`), with ioctl: `chardev.Register`      |
+| `gokm/fs`      | filesystems (mmap and xattrs included): `fs.Register`                  |
+| `gokm/chardev` | character devices (`/dev/<name>`), ioctl, poll: `chardev.Register`     |
 | `gokm/procfs`  | `/proc` files: `procfs.Create`                                         |
-| `gokm/netdev`  | network interfaces (point-to-point IP, like TUN): `netdev.Register`    |
+| `gokm/netdev`  | network interfaces (IP like TUN, or Ethernet like TAP): `netdev.Register` |
 | `gokm/blk`     | block devices (`/dev/<name>`, partitions included): `blk.Register`     |
 | `gokm/linux`   | generated bindings to any kernel function, struct or constant          |
 
@@ -102,13 +102,24 @@ func (d *dir) Attr() fs.Attr                                  { return fs.Attr{M
 func (d *dir) Lookup(name string) (fs.Node, error)            { ... }
 func (d *dir) ReadDir(yield func(string, fs.Node) bool) error { ... }
 // optional: Create, Mkdir, Remove, Rename, Symlink; files: ReadAt, WriteAt,
-// Truncate; symlinks: Readlink
+// Truncate; symlinks: Readlink; any node: GetXattr/SetXattr/RemoveXattr/ListXattrs
 
 fs.Register(&fs.FileSystem{Name: "gofs", Mount: func() (fs.Dir, error) { return newDir(), nil }})
 ```
 
 `examples/gofs` is a complete in-memory filesystem (files, directories,
-symlinks, rename, holes, truncation, `ENOSPC` when the heap is full).
+symlinks, rename, holes, truncation, xattrs, `ENOSPC` when the heap is
+full). Its test runs a binary stored in it.
+
+`read`/`write` go straight to `ReadAt`/`WriteAt`. `mmap` (shared or
+private, which also makes `exec` work) goes through the kernel's page cache.
+The page cache is filled with `ReadAt`, and dirty pages are written back
+with `WriteAt` (on `msync`, `fsync`, or when the kernel flushes).
+The framework keeps both paths coherent: `read` and `write` flush dirty
+mapped pages in their range first, and `write`/`truncate` drop the cached
+pages they changed. Extended attributes in the `user.` and `trusted.`
+namespaces go to the node's `Xattrer`; the framework handles the
+create/replace flags and buffer sizes.
 
 **Block-device filesystems:** set `MountDevice` instead of `Mount` and the
 filesystem mounts from a device (`mount -t name /dev/sdb1 /mnt`).
@@ -132,6 +143,17 @@ chardev.Register(&chardev.Device{Name: "gorev", Mode: 0o666,
 // Ioctl(cmd, arg): commands built with chardev.IO/IOR/IOW/IOWR, user
 // pointers accessed with chardev.CopyFromUser/CopyToUser
 
+// Data that arrives over time: Poll for poll/select/epoll, Wait to block
+// (EAGAIN with O_NONBLOCK, EINTR on signals), Wake when things change.
+func (s *session) ReadFlags(p []byte, off int64, fl chardev.Flags) (int, error) {
+	if err := dev.Wait(fl, func() bool { return pending() > 0 }); err != nil {
+		return 0, err
+	}
+	...
+}
+func (s *session) Poll() chardev.PollEvents { ... chardev.PollIn ... }
+// producer (a goroutine, a network callback, any context): dev.Wake()
+
 procfs.Create("gorev", procfs.ReadFunc(func() ([]byte, error) {
 	return []byte(fmt.Sprintf("writes: %d\n", writes)), nil
 }))  // implement Write(p []byte) error too for a writable file
@@ -152,8 +174,12 @@ By default `Transmit` runs from a workqueue (process context). With
 `AtomicTransmit` it runs directly in the kernel's transmit path (atomic
 context): it must not block (use atomics or `kernel.SpinLock`). While a
 garbage collection is in progress packets fall back to the workqueue.
-`examples/gonet` is a network device answering ping and UDP echo (20000-packet
-floods included).
+With `Ethernet: true` the interface is an Ethernet device (like TAP):
+`Transmit` and `Receive` carry whole frames, it has a MAC address (`MAC`,
+random if zero; `HardwareAddr()` reads the current one), and the kernel
+runs ARP and IPv6 neighbor discovery over it. `examples/gonet` has both
+kinds. `goecho0` answers ping and UDP echo (20000-packet floods included).
+`goeth0` simulates a host on an Ethernet link that answers ARP.
 
 ### gokm/blk
 
@@ -169,8 +195,9 @@ blk.Register(&blk.Disk{Name: "gobrd%d", Size: 64 << 20, Device: &ram{}})  // /de
 
 The kernel's block layer (blk-mq) queues and merges I/O. Requests reach Go
 in process context, so the `Device` can block and allocate, and several
-requests run at once on different CPUs. Disks get a dynamic device number
-and can be partitioned. `examples/gobrd` ports Linux's RAM disk
+requests run at once on different CPUs (one hardware queue per CPU by
+default: `Queues`, `QueueDepth`). Disks get a dynamic device number and can
+be partitioned. `examples/gobrd` ports Linux's RAM disk
 (`drivers/block/brd.c`), and its test checks it against brd itself.
 
 ### Module parameters
@@ -271,8 +298,8 @@ pointers**: store a `kernel.Handle` instead (frameworks already do).
 | `examples/hello`      | the basics                                                           |
 | `examples/gcstress`   | the GC under pressure                                                |
 | `examples/gofs`       | a filesystem (`gokm/fs`)                                             |
-| `examples/devices`    | `/dev/gorev` with ioctls + `/proc/gorev` (`gokm/chardev`, `gokm/procfs`) |
-| `examples/gonet`      | a network device answering ping/UDP echo in atomic context          |
+| `examples/devices`    | `/dev/gorev` with ioctls, `/dev/gopipe` with poll/blocking I/O, `/proc/gorev` |
+| `examples/gonet`      | an IP device answering ping/UDP echo in atomic context, and an Ethernet one with ARP |
 | `examples/gobrd`      | a RAM disk, ported from Linux's brd (`gokm/blk`, module parameters)  |
 | `examples/sysinfo`    | `gokm/linux`: functions, structs, inline functions, by-value structs, macros, pragmas |
 
@@ -322,9 +349,14 @@ runtime C (shim, threads, heap) + framework glue + generated wrappers + go.o ─
   or block delay it.
 - **Small stacks**: Go runs on 16 KB kernel stacks (the caller's, or a
   goroutine kthread's); `gokm build` warns about deep or recursive paths.
-- Framework coverage: `gokm/fs` has no mmap or xattrs, `gokm/chardev` no
-  poll, `gokm/netdev` is point-to-point IP only (no Ethernet/ARP), `gokm/blk`
-  has one hardware queue and no zoned devices.
+- Framework coverage, what's still missing:
+  - `gokm/fs`: POSIX ACLs and `security.*` xattrs, file locking beyond
+    the VFS's own, `fallocate`, direct I/O, and large folios. Page-cache use
+    is limited to mmap.
+  - `gokm/chardev`: mmap of device memory and `fasync`.
+  - `gokm/netdev`: offloads (checksum, TSO/GRO), multiple queues, and
+    ethtool.
+  - `gokm/blk`: zoned devices and per-request timeouts.
 - `gokm/linux` can't call variadic functions directly (use `//gokm:inline`).
 - x86-64 only; GPL-compatible licenses only. TinyGo runtime internals are
   used and may change between TinyGo versions.
