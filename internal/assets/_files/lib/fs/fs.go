@@ -30,6 +30,7 @@ package fs
 import (
 	"io"
 	"sync"
+	"time"
 	"unsafe"
 
 	"gokm/kernel"
@@ -54,6 +55,8 @@ func (m Mode) IsSymlink() bool { return m&ModeType == ModeSymlink }
 type Attr struct {
 	Mode Mode  // type and permissions
 	Size int64 // size in bytes (regular files)
+	// Timestamps; zero values leave the kernel's in-memory ones.
+	Atime, Mtime, Ctime time.Time
 }
 
 // Node is anything in the filesystem.
@@ -131,6 +134,12 @@ type FileSystem struct {
 	Magic uint32
 	// Mount is called for each mount and returns its root directory.
 	Mount func() (Dir, error)
+	// MountDevice, instead of Mount, makes this a block-device filesystem
+	// (mount -t name /dev/... /mnt): it gets the device and returns the
+	// root directory.
+	MountDevice func(dev *Device, opts MountOptions) (Dir, error)
+	// MaxFileSize limits file sizes (default: the kernel's maximum).
+	MaxFileSize int64
 
 	ptr    uintptr // kernel struct, 0 when not registered
 	handle kernel.Handle
@@ -139,7 +148,7 @@ type FileSystem struct {
 // Implemented in the fs glue (gokm/frameworks/fs/fs.c).
 //
 //export gokm_fs_register
-func cRegister(name *byte, nameLen int, magic uint32, handle uintptr, out *uintptr) int
+func cRegister(name *byte, nameLen int, magic uint32, requiresDev bool, maxBytes int64, handle uintptr, out *uintptr) int
 
 //export gokm_fs_unregister
 func cUnregister(ptr uintptr)
@@ -150,8 +159,8 @@ func cEmit(ctx uintptr, name *byte, nameLen int, ino uint64, dtype uint32) bool
 // Register registers the filesystem type with the kernel. It's unregistered
 // automatically at module exit (or earlier with Unregister).
 func Register(f *FileSystem) error {
-	if f.Name == "" || f.Mount == nil {
-		return kernel.EINVAL
+	if f.Name == "" || (f.Mount == nil) == (f.MountDevice == nil) {
+		return kernel.EINVAL // exactly one of Mount and MountDevice
 	}
 	if f.ptr != 0 {
 		return kernel.EBUSY
@@ -161,7 +170,7 @@ func Register(f *FileSystem) error {
 	}
 	f.handle = kernel.NewHandle(f)
 	name := f.Name + "\x00"
-	if rc := cRegister(unsafe.StringData(name), len(f.Name), f.Magic, uintptr(f.handle), &f.ptr); rc != 0 {
+	if rc := cRegister(unsafe.StringData(name), len(f.Name), f.Magic, f.MountDevice != nil, f.MaxFileSize, uintptr(f.handle), &f.ptr); rc != 0 {
 		f.handle.Delete()
 		f.ptr = 0
 		return kernel.Errno(-rc)
@@ -271,10 +280,17 @@ func viewBytes(p *byte, n int) []byte {
 // GOKM_LEAVE. Go int is 64 bits (long in C).
 
 //export gokm_fs_go_mount
-func goMount(fsHandle uintptr, out *uintptr) (rc int) {
+func goMount(fsHandle, sb uintptr, blockSize int, size int64, readOnly bool, out *uintptr) (rc int) {
 	defer kernel.CatchPanic(&rc)
 	f := kernel.Handle(fsHandle).Value().(*FileSystem)
-	root, err := f.Mount()
+	var root Dir
+	var err error
+	if f.MountDevice != nil {
+		dev := &Device{sb: sb, blockSize: blockSize, size: size, readOnly: readOnly}
+		root, err = f.MountDevice(dev, MountOptions{ReadOnly: readOnly})
+	} else {
+		root, err = f.Mount()
+	}
 	if err != nil {
 		return kernel.ToErrno(err)
 	}
@@ -287,18 +303,24 @@ func goMount(fsHandle uintptr, out *uintptr) (rc int) {
 	return 0
 }
 
+// gokm_fs_go_unmount runs before the device is released (put_super).
+//
 //export gokm_fs_go_unmount
 func goUnmount(h uintptr) {
 	defer kernel.CatchPanic[int](nil)
-	m := getMount(h)
-	if u, ok := m.root.(Unmounter); ok {
+	if u, ok := getMount(h).root.(Unmounter); ok {
 		u.Unmount()
 	}
+}
+
+//export gokm_fs_go_release
+func goRelease(h uintptr) {
+	defer kernel.CatchPanic[int](nil)
 	kernel.Handle(h).Delete()
 }
 
 //export gokm_fs_go_stat
-func goStat(h uintptr, ino uint64, mode *uint32, size *int64) (rc int) {
+func goStat(h uintptr, ino uint64, mode *uint32, size, atime, mtime, ctime *int64) (rc int) {
 	defer kernel.CatchPanic(&rc)
 	n, ok := getMount(h).node(ino)
 	if !ok {
@@ -308,6 +330,7 @@ func goStat(h uintptr, ino uint64, mode *uint32, size *int64) (rc int) {
 	a.Mode = withType(n, a.Mode)
 	*mode = uint32(a.Mode)
 	*size = a.Size
+	*atime, *mtime, *ctime = nsOf(a.Atime), nsOf(a.Mtime), nsOf(a.Ctime)
 	if a.Mode.IsSymlink() && a.Size == 0 {
 		if rl, ok := n.(Readlinker); ok {
 			if t, err := rl.Readlink(); err == nil {
@@ -489,7 +512,13 @@ func goReadlink(h uintptr, ino uint64, buf **byte, n *int) (rc int) {
 //export gokm_fs_go_evict
 func goEvict(h uintptr, ino uint64) {
 	defer kernel.CatchPanic[int](nil)
-	getMount(h).forget(ino)
+	m := getMount(h)
+	if n, ok := m.node(ino); ok {
+		if f, ok := n.(Forgetter); ok {
+			f.Forget()
+		}
+	}
+	m.forget(ino)
 }
 
 //export gokm_fs_go_read

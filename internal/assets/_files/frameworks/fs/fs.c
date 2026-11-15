@@ -18,6 +18,10 @@
 #include <linux/minmax.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/buffer_head.h>
+#include <linux/blkdev.h>
+#include <linux/math64.h>
+#include <linux/statfs.h>
 
 #include "gokm.h"
 
@@ -25,9 +29,16 @@
 #define GOKM_FS_MAX_IO		(128 * 1024)
 
 /* Implemented in Go (lib/fs/fs.go). Go int is 64-bit: long. */
-long gokm_fs_go_mount(unsigned long fs, unsigned long *out);
+long gokm_fs_go_mount(unsigned long fs, unsigned long sb, long block_size, s64 size,
+		      bool read_only, unsigned long *out);
 void gokm_fs_go_unmount(unsigned long m);
-long gokm_fs_go_stat(unsigned long m, u64 ino, u32 *mode, s64 *size);
+void gokm_fs_go_release(unsigned long m);
+long gokm_fs_go_stat(unsigned long m, u64 ino, u32 *mode, s64 *size,
+		     s64 *atime, s64 *mtime, s64 *ctime);
+long gokm_fs_go_statfs(unsigned long m, s64 *bsize, s64 *blocks, s64 *bfree, s64 *bavail,
+		       s64 *files, s64 *ffree, s64 *namelen);
+long gokm_fs_go_sync(unsigned long m);
+long gokm_fs_go_settimes(unsigned long m, u64 ino, s64 atime, s64 mtime);
 s64 gokm_fs_go_lookup(unsigned long m, u64 dir, const unsigned char *name, long len);
 s64 gokm_fs_go_create(unsigned long m, u64 dir, const unsigned char *name, long len, u32 mode);
 long gokm_fs_go_remove(unsigned long m, u64 dir, const unsigned char *name, long len, bool is_dir);
@@ -43,8 +54,12 @@ s64 gokm_fs_go_symlink(unsigned long m, u64 dir, const unsigned char *name, long
 long gokm_fs_go_readlink(unsigned long m, u64 ino, const char **buf, long *len);
 
 /* Called from Go. */
-long gokm_fs_register(const char *name, long len, u32 magic, unsigned long handle,
-		      unsigned long *out);
+long gokm_fs_register(const char *name, long len, u32 magic, bool requires_dev,
+		      s64 max_bytes, unsigned long handle, unsigned long *out);
+long gokm_fs_dev_read(unsigned long sbp, u64 block, void *dst, long nblocks);
+long gokm_fs_dev_write(unsigned long sbp, u64 block, const void *src, long nblocks);
+long gokm_fs_dev_sync(unsigned long sbp);
+long gokm_fs_dev_set_blocksize(unsigned long sbp, long size);
 void gokm_fs_unregister(unsigned long ptr);
 bool gokm_fs_emit(unsigned long ctx, const char *name, long len, u64 ino, u32 dtype);
 
@@ -52,6 +67,8 @@ struct gokm_fs_type {
 	struct file_system_type type;
 	unsigned long handle;	/* kernel.Handle of the Go FileSystem */
 	u32 magic;
+	bool requires_dev;	/* block-device filesystem (MountDevice) */
+	s64 max_bytes;
 };
 
 static const struct inode_operations gokm_fs_dir_iops, gokm_fs_file_iops, gokm_fs_symlink_iops;
@@ -63,23 +80,49 @@ static inline unsigned long gokm_fs_mount(struct super_block *sb)
 	return (unsigned long)sb->s_fs_info;
 }
 
-/* Fill an inode's mode/size from Go. */
+static struct timespec64 gokm_fs_ts(s64 ns)
+{
+	s32 rem;
+	s64 sec = div_s64_rem(ns, NSEC_PER_SEC, &rem);
+
+	if (rem < 0) {
+		sec--;
+		rem += NSEC_PER_SEC;
+	}
+	return (struct timespec64){ .tv_sec = sec, .tv_nsec = rem };
+}
+
+/* Fill an inode's mode/size/timestamps from Go. */
 static int gokm_fs_refresh(struct inode *inode, bool init)
 {
+	s64 size, atime = 0, mtime = 0, ctime = 0;
 	u32 mode;
-	s64 size;
 	long err;
 
 	GOKM_ENTER();
-	err = gokm_fs_go_stat(gokm_fs_mount(inode->i_sb), inode->i_ino, &mode, &size);
+	err = gokm_fs_go_stat(gokm_fs_mount(inode->i_sb), inode->i_ino, &mode, &size,
+			      &atime, &mtime, &ctime);
 	GOKM_LEAVE();
 	if (err)
 		return err;
-	if (init)
+	if (init) {
 		inode->i_mode = mode;
+		simple_inode_init_ts(inode);
+	}
 	if (S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode))
 		i_size_write(inode, size);
+	if (atime)
+		inode_set_atime_to_ts(inode, gokm_fs_ts(atime));
+	if (mtime)
+		inode_set_mtime_to_ts(inode, gokm_fs_ts(mtime));
+	if (ctime)
+		inode_set_ctime_to_ts(inode, gokm_fs_ts(ctime));
 	return 0;
+}
+
+static s64 gokm_fs_ns(struct timespec64 ts)
+{
+	return timespec64_to_ns(&ts);
 }
 
 static struct inode *gokm_fs_iget(struct super_block *sb, u64 ino)
@@ -98,7 +141,6 @@ static struct inode *gokm_fs_iget(struct super_block *sb, u64 ino)
 		iget_failed(inode);
 		return ERR_PTR(err);
 	}
-	simple_inode_init_ts(inode);
 	if (S_ISDIR(inode->i_mode)) {
 		inode->i_op = &gokm_fs_dir_iops;
 		inode->i_fop = &gokm_fs_dir_fops;
@@ -406,8 +448,31 @@ static int gokm_fs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		i_size_write(inode, attr->ia_size);
 		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
 	}
+	if (attr->ia_valid & (ATTR_ATIME | ATTR_MTIME)) {
+		GOKM_ENTER();
+		err = gokm_fs_go_settimes(gokm_fs_mount(inode->i_sb), inode->i_ino,
+					  (attr->ia_valid & ATTR_ATIME) ? gokm_fs_ns(attr->ia_atime) : 0,
+					  (attr->ia_valid & ATTR_MTIME) ? gokm_fs_ns(attr->ia_mtime) : 0);
+		GOKM_LEAVE();
+		if (err)
+			return err;
+	}
 	setattr_copy(idmap, inode, attr);
 	return 0;
+}
+
+/* fsync: flush the filesystem's metadata (Syncer), then the device. */
+static int gokm_fs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct super_block *sb = file_inode(file)->i_sb;
+	long err;
+
+	GOKM_ENTER();
+	err = gokm_fs_go_sync(gokm_fs_mount(sb));
+	GOKM_LEAVE();
+	if (!err && sb->s_bdev)
+		err = sync_blockdev(sb->s_bdev);
+	return err;
 }
 
 static const struct inode_operations gokm_fs_dir_iops = {
@@ -442,6 +507,7 @@ static const struct file_operations gokm_fs_file_fops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= gokm_fs_read_iter,
 	.write_iter	= gokm_fs_write_iter,
+	.fsync		= gokm_fs_fsync,
 };
 
 /* ---- Superblock ------------------------------------------------------ */
@@ -457,10 +523,124 @@ static void gokm_fs_evict_inode(struct inode *inode)
 	}
 }
 
+static int gokm_fs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	struct super_block *sb = dentry->d_sb;
+	s64 bsize, blocks, bfree, bavail, files, ffree, namelen;
+	long err;
+
+	GOKM_ENTER();
+	err = gokm_fs_go_statfs(gokm_fs_mount(sb), &bsize, &blocks, &bfree, &bavail,
+				&files, &ffree, &namelen);
+	GOKM_LEAVE();
+	if (err == -ENOSYS)
+		return simple_statfs(dentry, buf);
+	if (err)
+		return err;
+	buf->f_type = sb->s_magic;
+	buf->f_bsize = bsize;
+	buf->f_blocks = blocks;
+	buf->f_bfree = bfree;
+	buf->f_bavail = bavail;
+	buf->f_files = files;
+	buf->f_ffree = ffree;
+	buf->f_namelen = namelen;
+	if (sb->s_bdev)
+		buf->f_fsid = u64_to_fsid(huge_encode_dev(sb->s_bdev->bd_dev));
+	return 0;
+}
+
+static int gokm_fs_sync_fs(struct super_block *sb, int wait)
+{
+	long err;
+
+	GOKM_ENTER();
+	err = gokm_fs_go_sync(gokm_fs_mount(sb));
+	GOKM_LEAVE();
+	return err;
+}
+
+/* Before the device is released: the filesystem flushes its state. */
+static void gokm_fs_put_super(struct super_block *sb)
+{
+	GOKM_ENTER();
+	gokm_fs_go_unmount(gokm_fs_mount(sb));
+	GOKM_LEAVE();
+}
+
 static const struct super_operations gokm_fs_sops = {
-	.statfs		= simple_statfs,
+	.statfs		= gokm_fs_statfs,
 	.evict_inode	= gokm_fs_evict_inode,
+	.sync_fs	= gokm_fs_sync_fs,
+	.put_super	= gokm_fs_put_super,
 };
+
+/* ---- Block devices (fs.Device) ---------------------------------------- */
+
+long gokm_fs_dev_read(unsigned long sbp, u64 block, void *dst, long nblocks)
+{
+	struct super_block *sb = (struct super_block *)sbp;
+	long i, err = 0;
+
+	/*
+	 * May wait for I/O: let other tasks run Go (and collect) meanwhile. dst
+	 * stays valid: it's referenced from the parked caller and the
+	 * collector doesn't move objects.
+	 */
+	GOKM_PARK();
+	for (i = 0; i < nblocks; i++) {
+		struct buffer_head *bh = sb_bread(sb, block + i);
+
+		if (!bh) {
+			err = -EIO;
+			break;
+		}
+		memcpy(dst + i * sb->s_blocksize, bh->b_data, sb->s_blocksize);
+		brelse(bh);
+	}
+	GOKM_UNPARK();
+	return err;
+}
+
+long gokm_fs_dev_write(unsigned long sbp, u64 block, const void *src, long nblocks)
+{
+	struct super_block *sb = (struct super_block *)sbp;
+	long i, err = 0;
+
+	GOKM_PARK();
+	for (i = 0; i < nblocks; i++) {
+		struct buffer_head *bh = sb_getblk(sb, block + i);
+
+		if (!bh) {
+			err = -ENOMEM;
+			break;
+		}
+		lock_buffer(bh);
+		memcpy(bh->b_data, src + i * sb->s_blocksize, sb->s_blocksize);
+		set_buffer_uptodate(bh);
+		unlock_buffer(bh);
+		mark_buffer_dirty(bh);
+		brelse(bh);
+	}
+	GOKM_UNPARK();
+	return err;
+}
+
+long gokm_fs_dev_sync(unsigned long sbp)
+{
+	struct super_block *sb = (struct super_block *)sbp;
+	long err;
+
+	GOKM_PARK();
+	err = sync_blockdev(sb->s_bdev);
+	GOKM_UNPARK();
+	return err;
+}
+
+long gokm_fs_dev_set_blocksize(unsigned long sbp, long size)
+{
+	return sb_set_blocksize((struct super_block *)sbp, size) ? 0 : -EINVAL;
+}
 
 static int gokm_fs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
@@ -469,15 +649,24 @@ static int gokm_fs_fill_super(struct super_block *sb, struct fs_context *fc)
 	struct inode *root;
 	long err;
 
-	sb->s_maxbytes = MAX_LFS_FILESIZE;
-	sb->s_blocksize = PAGE_SIZE;
-	sb->s_blocksize_bits = PAGE_SHIFT;
+	s64 dev_size = 0;
+
+	sb->s_maxbytes = t->max_bytes ? t->max_bytes : MAX_LFS_FILESIZE;
 	sb->s_magic = t->magic;
 	sb->s_op = &gokm_fs_sops;
 	sb->s_time_gran = 1;
+	if (t->requires_dev) {
+		if (!sb_set_blocksize(sb, max_t(int, 512, bdev_logical_block_size(sb->s_bdev))))
+			return -EINVAL;
+		dev_size = bdev_nr_bytes(sb->s_bdev);
+	} else {
+		sb->s_blocksize = PAGE_SIZE;
+		sb->s_blocksize_bits = PAGE_SHIFT;
+	}
 
 	GOKM_ENTER();
-	err = gokm_fs_go_mount(t->handle, &m);
+	err = gokm_fs_go_mount(t->handle, (unsigned long)sb, sb->s_blocksize, dev_size,
+			       sb_rdonly(sb), &m);
 	GOKM_LEAVE();
 	if (err)
 		return err;
@@ -492,6 +681,10 @@ static int gokm_fs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 static int gokm_fs_get_tree(struct fs_context *fc)
 {
+	struct gokm_fs_type *t = container_of(fc->fs_type, struct gokm_fs_type, type);
+
+	if (t->requires_dev)
+		return get_tree_bdev(fc, gokm_fs_fill_super);
 	return get_tree_nodev(fc, gokm_fs_fill_super);
 }
 
@@ -507,18 +700,23 @@ static int gokm_fs_init_fs_context(struct fs_context *fc)
 
 static void gokm_fs_kill_sb(struct super_block *sb)
 {
+	struct gokm_fs_type *t = container_of(sb->s_type, struct gokm_fs_type, type);
 	unsigned long m = gokm_fs_mount(sb);
 
-	kill_anon_super(sb);	/* evicts inodes, which may call into Go */
+	/* Evicts inodes and calls put_super (both may call into Go). */
+	if (t->requires_dev)
+		kill_block_super(sb);
+	else
+		kill_anon_super(sb);
 	if (m) {
 		GOKM_ENTER();
-		gokm_fs_go_unmount(m);
+		gokm_fs_go_release(m);
 		GOKM_LEAVE();
 	}
 }
 
-long gokm_fs_register(const char *name, long len, u32 magic, unsigned long handle,
-		      unsigned long *out)
+long gokm_fs_register(const char *name, long len, u32 magic, bool requires_dev,
+		      s64 max_bytes, unsigned long handle, unsigned long *out)
 {
 	struct gokm_fs_type *t;
 	char *kname;
@@ -537,6 +735,10 @@ long gokm_fs_register(const char *name, long len, u32 magic, unsigned long handl
 	t->type.kill_sb = gokm_fs_kill_sb;
 	t->handle = handle;
 	t->magic = magic;
+	t->requires_dev = requires_dev;
+	t->max_bytes = max_bytes;
+	if (requires_dev)
+		t->type.fs_flags = FS_REQUIRES_DEV;
 
 	err = register_filesystem(&t->type);
 	if (err) {

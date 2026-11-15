@@ -28,6 +28,8 @@ type sourceScan struct {
 	names   []string // referenced linux.X names
 	pragmas []bindgen.Pragma
 	headers []string // from //gokm:include and pragma arguments
+	params  []moduleParam // //gokm:param variables
+	root    string        // project directory
 }
 
 // prepareSource copies the project's module into dst, rewriting gokm
@@ -44,7 +46,7 @@ func prepareSource(proj, dst string) (*sourceScan, error) {
 	if err := os.RemoveAll(dst); err != nil {
 		return nil, err
 	}
-	scan := &sourceScan{}
+	scan := &sourceScan{root: filepath.Clean(proj)}
 	names := map[string]bool{}
 	err := filepath.WalkDir(proj, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -77,6 +79,16 @@ func prepareSource(proj, dst string) (*sourceScan, error) {
 		return os.WriteFile(filepath.Join(dst, rel), data, 0o644)
 	})
 	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, p := range scan.params {
+		if seen[p.Name] {
+			return nil, fmt.Errorf("%s: duplicate //gokm:param %s", p.Pos, p.Name)
+		}
+		seen[p.Name] = true
+	}
+	if err := writeParamsGo(dst, scan.params); err != nil {
 		return nil, err
 	}
 	for n := range names {
@@ -113,6 +125,14 @@ func scanFile(path string, src []byte, scan *sourceScan, names map[string]bool) 
 			}
 			return true
 		})
+	}
+
+	if filepath.Dir(path) == scan.root {
+		params, err := scanParams(f, fset, path)
+		if err != nil {
+			return nil, err
+		}
+		scan.params = append(scan.params, params...)
 	}
 
 	type edit struct {

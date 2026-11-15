@@ -10,6 +10,10 @@
 #   EXPECT_LOAD_ERRNO=ENODEV    expect loading to fail with this errno
 #   KERNEL=/boot/vmlinuz-linux  kernel image to boot (must match the kernel
 #                               the module was built for)
+#   EXTRA_MODULES="drivers/block/brd.ko.zst ..."
+#                               modules of the booted kernel (paths under
+#                               /lib/modules/<version>/kernel) copied to
+#                               /extra/ in the VM, for TEST_PROG to load
 set -eu
 
 KO=$(realpath "$1")
@@ -25,6 +29,13 @@ cp "$KO" "$WORK/root/module.ko"
 echo "$*" >"$WORK/root/params"
 if [ -n "${TEST_PROG:-}" ]; then
 	(cd "$TEST_PROG" && CGO_ENABLED=0 GOWORK=off go build -o "$WORK/root/test" .)
+fi
+if [ -n "${EXTRA_MODULES:-}" ]; then
+	KVER=$(file -bL "$KERNEL" | sed -n 's/.*version \([^ ]*\).*/\1/p')
+	mkdir -p "$WORK/root/extra"
+	for m in $EXTRA_MODULES; do
+		cp "/lib/modules/$KVER/kernel/$m" "$WORK/root/extra/"
+	done
 fi
 if [ -n "${EXPECT_LOAD_ERRNO:-}" ]; then
 	echo "$EXPECT_LOAD_ERRNO" >"$WORK/root/expect_errno"

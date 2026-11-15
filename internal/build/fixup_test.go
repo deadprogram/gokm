@@ -6,7 +6,8 @@ import (
 )
 
 func TestFixupIR(t *testing.T) {
-	in := `declare void @gokm_abort() local_unnamed_addr #4
+	in := `@gokm_param_x = external local_unnamed_addr global i64, align 8
+declare void @gokm_abort() local_unnamed_addr #4
 declare void @gokm_print(ptr, i64) local_unnamed_addr #4
 attributes #0 = { mustprogress nounwind willreturn memory(none) }
 attributes #3 = { nounwind uwtable(sync) "target-cpu"="x86-64" "target-features"="-sse" }
@@ -16,6 +17,7 @@ attributes #4 = { "target-cpu"="x86-64" }
 	out := string(fixupIR([]byte(in)))
 
 	for _, want := range []string{
+		"@gokm_param_x = external dso_local local_unnamed_addr global i64, align 8\n",
 		"declare void @gokm_abort() local_unnamed_addr noreturn #4\n",
 		"declare void @gokm_print(ptr, i64) local_unnamed_addr #4\n",
 		// intrinsic attribute groups (no target-cpu) are left alone

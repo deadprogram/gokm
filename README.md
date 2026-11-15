@@ -70,6 +70,7 @@ Everything except the final `.ko` goes into `~/.cache/gokm` (or `$GOKMCACHE`).
 | `gokm/chardev` | character devices (`/dev/<name>`), with ioctl: `chardev.Register`      |
 | `gokm/procfs`  | `/proc` files: `procfs.Create`                                         |
 | `gokm/netdev`  | network interfaces (point-to-point IP, like TUN): `netdev.Register`    |
+| `gokm/blk`     | block devices (`/dev/<name>`, partitions included): `blk.Register`     |
 | `gokm/linux`   | generated bindings to any kernel function, struct or constant          |
 
 Importing a framework package is all it takes: `gokm build` detects it and
@@ -109,6 +110,19 @@ fs.Register(&fs.FileSystem{Name: "gofs", Mount: func() (fs.Dir, error) { return 
 `examples/gofs` is a complete in-memory filesystem (files, directories,
 symlinks, rename, holes, truncation, `ENOSPC` when the heap is full).
 
+**Block-device filesystems:** set `MountDevice` instead of `Mount` and the
+filesystem mounts from a device (`mount -t name /dev/sdb1 /mnt`).
+`MountDevice` receives an `*fs.Device` that reads and writes blocks through
+the kernel's buffer cache (`ReadBlocks`, `WriteBlocks`, `Sync`,
+`SetBlockSize`). The root `Dir` can also implement:
+- `Statfser`, for statfs numbers;
+- `Syncer`, called on sync/fsync/unmount;
+- `Unmounter`.
+
+Nodes can implement `SetTimer` (utimes) and `Forgetter` (the kernel let go
+of a removed node: release its storage). `Attr` carries timestamps.
+[govfat](https://github.com/jespino/govfat) is a FAT32 driver built this way.
+
 ### gokm/chardev and gokm/procfs
 
 ```go
@@ -140,6 +154,38 @@ context): it must not block (use atomics or `kernel.SpinLock`). While a
 garbage collection is in progress packets fall back to the workqueue.
 `examples/gonet` is a network device answering ping and UDP echo (20000-packet
 floods included).
+
+### gokm/blk
+
+```go
+type ram struct{ ... }
+
+func (r *ram) ReadAt(p []byte, off int64) error  { ... }  // one segment of a request
+func (r *ram) WriteAt(p []byte, off int64) error { ... }
+// optional: Flush() error (advertises a write cache), Discard(off, n int64) error
+
+blk.Register(&blk.Disk{Name: "gobrd%d", Size: 64 << 20, Device: &ram{}})  // /dev/gobrd0
+```
+
+The kernel's block layer (blk-mq) queues and merges I/O. Requests reach Go
+in process context, so the `Device` can block and allocate, and several
+requests run at once on different CPUs. Disks get a dynamic device number
+and can be partitioned. `examples/gobrd` ports Linux's RAM disk
+(`drivers/block/brd.c`), and its test checks it against brd itself.
+
+### Module parameters
+
+```go
+//gokm:param rd_size Size of each RAM disk in kbytes.
+var rdSize uint = 4096
+```
+
+A package-level variable in package `main` becomes a module parameter:
+`insmod gobrd.ko rd_size=65536`, `modinfo`, and read-only in
+`/sys/module/<name>/parameters/`. The initializer (a constant expression)
+is the default. The loaded value is in the variable when `main` and the
+`init` functions run. Supported types: `int`, `int64`, `int32`, `int16`,
+`uint`, `uint64`, `uint32`, `uint16`, `byte`, `bool` and `string`.
 
 ### gokm/linux: bindings generated from the kernel's BTF
 
@@ -227,6 +273,7 @@ pointers**: store a `kernel.Handle` instead (frameworks already do).
 | `examples/gofs`       | a filesystem (`gokm/fs`)                                             |
 | `examples/devices`    | `/dev/gorev` with ioctls + `/proc/gorev` (`gokm/chardev`, `gokm/procfs`) |
 | `examples/gonet`      | a network device answering ping/UDP echo in atomic context          |
+| `examples/gobrd`      | a RAM disk, ported from Linux's brd (`gokm/blk`, module parameters)  |
 | `examples/sysinfo`    | `gokm/linux`: functions, structs, inline functions, by-value structs, macros, pragmas |
 
 Each has a test program that `make qemu` runs inside a VM against the loaded
@@ -258,7 +305,7 @@ runtime C (shim, threads, heap) + framework glue + generated wrappers + go.o ─
   (heap chunks, background collector), `shim.c` (module init/exit,
   services, IBT-safe `longjmp` for `recover()`).
 - **IR fixups** (`internal/build/fixup.go`): `noredzone`, return thunks, IBT
-  `endbr64`, no unwind tables.
+  `endbr64`, no unwind tables, direct (non-GOT) access to C globals.
 - **compiler-rt** builtins (soft-float, 128-bit math) compiled once with the
   kernel flags; only what a module needs is linked in.
 - **Frameworks** (`_files/lib/<pkg>` + `_files/frameworks/<pkg>`).
@@ -276,7 +323,8 @@ runtime C (shim, threads, heap) + framework glue + generated wrappers + go.o ─
 - **Small stacks**: Go runs on 16 KB kernel stacks (the caller's, or a
   goroutine kthread's); `gokm build` warns about deep or recursive paths.
 - Framework coverage: `gokm/fs` has no mmap or xattrs, `gokm/chardev` no
-  poll, `gokm/netdev` is point-to-point IP only (no Ethernet/ARP).
+  poll, `gokm/netdev` is point-to-point IP only (no Ethernet/ARP), `gokm/blk`
+  has one hardware queue and no zoned devices.
 - `gokm/linux` can't call variadic functions directly (use `//gokm:inline`).
 - x86-64 only; GPL-compatible licenses only. TinyGo runtime internals are
   used and may change between TinyGo versions.

@@ -10,7 +10,7 @@ import (
 var (
 	fnAttrGroupRe = regexp.MustCompile(`^attributes #\d+ = \{ (.*"target-cpu".*)$`)
 	uwtableRe     = regexp.MustCompile(` ?\buwtable(\((sync|async)\))?`)
-	noreturnDecl  = regexp.MustCompile(`^(declare void @gokm_(abort|out_of_memory)\([^)]*\)) local_unnamed_addr #`)
+	noreturnDecl  = regexp.MustCompile(`^(declare void @gokm_(abort|out_of_memory|goexit)\([^)]*\)) local_unnamed_addr #`)
 )
 
 // fixupIR patches TinyGo's LLVM IR for the x86-64 kernel ABI, covering what a
@@ -25,6 +25,8 @@ var (
 //     of functions that can be reached by an indirect call.
 //   - noreturn on gokm_abort and gokm_out_of_memory (they BUG()), so objtool's
 //     control-flow analysis agrees with the C side.
+var externGlobalRe = regexp.MustCompile(`^(@[^ ]+ =) external`)
+
 func fixupIR(in []byte) []byte {
 	var out bytes.Buffer
 	out.Grow(len(in) + 1024)
@@ -40,6 +42,11 @@ func fixupIR(in []byte) []byte {
 			line = strings.Replace(line, "{ ", "{ noredzone fn_ret_thunk_extern ", 1)
 		case noreturnDecl.MatchString(line):
 			line = noreturnDecl.ReplaceAllString(line, "$1 local_unnamed_addr noreturn #")
+		case externGlobalRe.MatchString(line):
+			// Globals defined in C (//go:extern, e.g. //gokm:param
+			// storage): the kernel's module loader can't resolve GOT
+			// relocations, so they must be addressed directly.
+			line = externGlobalRe.ReplaceAllString(line, "$1 external dso_local")
 		case strings.HasPrefix(line, "!llvm.module.flags = !{"):
 			line = strings.Replace(line, "!{", "!{"+flagID+", ", 1)
 			sawFlags = true

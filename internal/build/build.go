@@ -84,7 +84,8 @@ func Build(opts Options) (*Result, error) {
 }
 
 type builder struct {
-	opts Options
+	opts   Options
+	params []moduleParam // //gokm:param variables of the project
 }
 
 func (b *builder) step(format string, args ...any) {
@@ -163,6 +164,9 @@ func (b *builder) run() (*Result, error) {
 	// The project is built from a copy, with gokm pragmas rewritten.
 	src := filepath.Join(work, "src")
 	scan, err := prepareSource(proj, src)
+	if scan != nil {
+		b.params = scan.params
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -479,6 +483,21 @@ func (b *builder) writeKmod(root *assets.Root, proj, kmod, name, modPath string,
 			return err
 		}
 		userObjs = append(userObjs, objs...)
+	}
+	if len(b.params) > 0 {
+		src, err := paramsC(b.params)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(kmod, "gokm_params.c"), src, 0o644); err != nil {
+			return err
+		}
+		userObjs = append(userObjs, "gokm_params.o")
+		var names []string
+		for _, p := range b.params {
+			names = append(names, p.Name)
+		}
+		b.step("module parameters: %s", strings.Join(names, ", "))
 	}
 	objs, err := copyCSources(filepath.Join(proj, CSrcDir), kmod, CSrcDir)
 	if err != nil {

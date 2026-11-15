@@ -34,6 +34,9 @@ func kmodKtimeNs() int64
 //export gokm_msleep
 func kmodMsleep(ms uint32)
 
+//export gokm_realtime_ns
+func kmodRealtimeNs() int64
+
 // putchar is used by the runtime's println/panic output (serialized by the
 // runtime's print lock). Bytes are collected into a line buffer and handed
 // to printk one full line at a time.
@@ -138,6 +141,8 @@ func tinygo_kmod_init(heapSize, heapMax uintptr) int {
 	if !gcInit(heapSize, heapMax) {
 		return -12 // ENOMEM
 	}
+	// time.Now: wall clock = monotonic (ktime_get_ns) + this offset.
+	timeOffset.Store(kmodRealtimeNs() - nanotime())
 	initRand()
 	initAll()
 	callMain()

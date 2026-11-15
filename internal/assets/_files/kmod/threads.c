@@ -411,7 +411,7 @@ static void __noreturn goroutine_bail(struct gokm_thread *t)
 	kthread_complete_and_exit(&gokm_bail_done, 0);
 }
 
-void gokm_goexit(void)
+void __noreturn gokm_goexit(void)
 {
 	struct gokm_thread *t = current_thread();
 

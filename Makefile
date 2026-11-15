@@ -20,12 +20,12 @@ test:
 	go vet ./...
 	go test ./...
 
-# qemu_test <name> <project dir> <build flags> <env for run.sh> <grep patterns...>:
+# qemu_test <name> <project dir> <build flags> <env for run.sh> <grep patterns...> [module params]:
 # build the module, boot it in QEMU (log in _qemu/<name>.log) and require
 # "TEST: PASS" plus every extra pattern in the log.
 define qemu_test
 	./gokm build -kver $(KVER) $(3) $(2)
-	$(4) sh test/qemu/run.sh $(2)/$(notdir $(2)).ko >_qemu/$(1).log 2>&1 || true
+	$(4) sh test/qemu/run.sh $(2)/$(notdir $(2)).ko $(6) >_qemu/$(1).log 2>&1 || true
 	@for p in "TEST: PASS" $(5); do \
 		grep -q "$$p" _qemu/$(1).log || { echo "FAIL: $(1): missing '$$p' (see _qemu/$(1).log)"; exit 1; }; \
 	done
@@ -40,6 +40,7 @@ qemu: gokm
 	$(call qemu_test,devices,examples/devices,,TEST_PROG=examples/devices/devtest,"devtest: ok   ioctls")
 	$(call qemu_test,gonet,examples/gonet,,TEST_PROG=examples/gonet/nettest,"nettest: ok   UDP flood" "nettest: ok   /proc/goecho counters")
 	$(call qemu_test,sysinfo,examples/sysinfo,,TEST_PROG=examples/sysinfo/infotest,"infotest: PASS")
+	$(call qemu_test,gobrd,examples/gobrd,,TEST_PROG=examples/gobrd/brdtest EXTRA_MODULES="drivers/block/brd.ko.zst fs/fat/fat.ko.zst fs/fat/vfat.ko.zst","brdtest: PASS" "unloaded. freed",rd_nr=2 rd_size=40960)
 	$(call qemu_test,failload,test/fixtures/failload,,EXPECT_LOAD_ERRNO=ENODEV,)
 	$(call qemu_test,nested,test/fixtures/nested,-heap-size 256K,,"nested: OK")
 	$(call qemu_test,parked,test/fixtures/parked,-heap-size 256K,TEST_PROG=test/fixtures/parked/parkedtest,"parkedtest: PASS")

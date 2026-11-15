@@ -175,6 +175,12 @@ s64 gokm_ktime_ns(void)
 	return ktime_get_ns();
 }
 
+/* Wall clock (time.Now): realtime = monotonic + offset. */
+s64 gokm_realtime_ns(void)
+{
+	return ktime_get_real_ns();
+}
+
 void gokm_bh_disable(void)
 {
 	local_bh_disable();
