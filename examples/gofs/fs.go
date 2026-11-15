@@ -1,11 +1,15 @@
 package main
 
 import (
-	"runtime"
+	"sync"
 
 	"gokm/fs"
 	"gokm/kernel"
 )
+
+// mu protects the whole tree: the kernel calls these methods concurrently
+// from several CPUs.
+var mu sync.Mutex
 
 // dir is a directory: entries in creation order.
 type dir struct {
@@ -20,11 +24,24 @@ func newDir(mode fs.Mode) *dir {
 
 func (d *dir) Attr() fs.Attr { return fs.Attr{Mode: fs.ModeDir | d.mode} }
 
-func (d *dir) Lookup(name string) (fs.Node, error) { return d.children[name], nil }
+func (d *dir) Lookup(name string) (fs.Node, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	return d.children[name], nil
+}
 
 func (d *dir) ReadDir(yield func(string, fs.Node) bool) error {
-	for _, name := range d.names {
-		if !yield(name, d.children[name]) {
+	// Snapshot under the lock, yield without it (yield calls back into
+	// methods that take it, like Attr).
+	mu.Lock()
+	names := append([]string(nil), d.names...)
+	nodes := make([]fs.Node, len(names))
+	for i, name := range names {
+		nodes[i] = d.children[name]
+	}
+	mu.Unlock()
+	for i, name := range names {
+		if !yield(name, nodes[i]) {
 			break
 		}
 	}
@@ -44,16 +61,26 @@ func (d *dir) add(name string, n fs.Node) error {
 }
 
 func (d *dir) Create(name string, mode fs.Mode) (fs.Node, error) {
+	mu.Lock()
+	defer mu.Unlock()
 	f := &file{mode: mode & fs.ModePerm}
 	return f, d.add(name, f)
 }
 
 func (d *dir) Mkdir(name string, mode fs.Mode) (fs.Dir, error) {
+	mu.Lock()
+	defer mu.Unlock()
 	sub := newDir(mode)
 	return sub, d.add(name, sub)
 }
 
 func (d *dir) Remove(name string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	return d.removeLocked(name)
+}
+
+func (d *dir) removeLocked(name string) error {
 	if d.children[name] == nil {
 		return kernel.ENOENT
 	}
@@ -67,6 +94,37 @@ func (d *dir) Remove(name string) error {
 	return nil
 }
 
+func (d *dir) Rename(oldName string, newDir fs.Dir, newName string) error {
+	mu.Lock()
+	defer mu.Unlock()
+	nd := newDir.(*dir)
+	n := d.children[oldName]
+	if n == nil {
+		return kernel.ENOENT
+	}
+	if nd.children[newName] != nil {
+		nd.removeLocked(newName) // replaced
+	}
+	d.removeLocked(oldName)
+	return nd.add(newName, n)
+}
+
+func (d *dir) Symlink(name, target string) (fs.Node, error) {
+	mu.Lock()
+	defer mu.Unlock()
+	l := &symlink{target: target}
+	return l, d.add(name, l)
+}
+
+// symlink is a symbolic link.
+type symlink struct{ target string }
+
+func (l *symlink) Attr() fs.Attr {
+	return fs.Attr{Mode: fs.ModeSymlink | 0o777, Size: int64(len(l.target))}
+}
+
+func (l *symlink) Readlink() (string, error) { return l.target, nil }
+
 // file is a regular file held in a Go byte slice.
 type file struct {
 	mode fs.Mode
@@ -74,10 +132,14 @@ type file struct {
 }
 
 func (f *file) Attr() fs.Attr {
+	mu.Lock()
+	defer mu.Unlock()
 	return fs.Attr{Mode: fs.ModeRegular | f.mode, Size: int64(len(f.data))}
 }
 
 func (f *file) ReadAt(p []byte, off int64) (int, error) {
+	mu.Lock()
+	defer mu.Unlock()
 	if off >= int64(len(f.data)) {
 		return 0, nil
 	}
@@ -85,6 +147,8 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (f *file) WriteAt(p []byte, off int64) (int, error) {
+	mu.Lock()
+	defer mu.Unlock()
 	end := off + int64(len(p))
 	if !f.reserve(end) {
 		return 0, kernel.ENOSPC
@@ -97,6 +161,8 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *file) Truncate(size int64) error {
+	mu.Lock()
+	defer mu.Unlock()
 	if l := int64(len(f.data)); size > l {
 		if !f.reserve(size) {
 			return kernel.ENOSPC
@@ -112,34 +178,22 @@ func (f *file) Truncate(size int64) error {
 	return nil
 }
 
-// reserve makes cap(f.data) >= size, failing (instead of panicking with out
-// of memory) when the GC heap doesn't have room.
+// reserve makes cap(f.data) >= size, failing (ENOSPC for the caller) when
+// the Go heap can't hold it: kernel.MakeBytes returns an error instead of
+// the fatal out-of-memory error of make.
 func (f *file) reserve(size int64) bool {
 	if size <= int64(cap(f.data)) {
 		return true
 	}
-	newCap := max(2*int64(cap(f.data)), size)
-	if !heapHasRoom(newCap) {
-		newCap = size
-		if !heapHasRoom(newCap) {
-			return false
-		}
+	nd, err := kernel.MakeBytes(int(max(2*int64(cap(f.data)), size)))
+	if err != nil {
+		nd, err = kernel.MakeBytes(int(size)) // without headroom
 	}
-	nd := make([]byte, len(f.data), newCap)
+	if err != nil {
+		return false
+	}
+	nd = nd[:len(f.data)]
 	copy(nd, f.data)
 	f.data = nd
 	return true
-}
-
-// heapHasRoom reports whether an allocation of size bytes will likely fit,
-// collecting garbage first if needed, with slack for fragmentation.
-func heapHasRoom(size int64) bool {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	if size*2 < int64(ms.HeapSys)-int64(ms.HeapInuse) {
-		return true
-	}
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	return size*2 < int64(ms.HeapSys)-int64(ms.HeapInuse)
 }

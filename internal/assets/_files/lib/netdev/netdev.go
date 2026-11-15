@@ -16,9 +16,14 @@
 //	d.iface = &netdev.Interface{Name: "go%d", Driver: d}
 //	err := netdev.Register(d.iface)
 //
-// Transmit runs in process context (from a workqueue): the kernel's transmit
-// hook runs in softirq context, where Go can't run, so packets are queued
-// (up to 1000; more are dropped and counted as tx_dropped).
+// By default Transmit runs in process context, from a workqueue: packets are
+// queued (up to 1000; more are dropped and counted as tx_dropped). With
+// AtomicTransmit it runs directly in the kernel's transmit path (atomic
+// context, BH disabled): much lower latency, but Transmit must not block
+// (no sync.Mutex, channels, time.Sleep or blocking calls: use atomics or
+// kernel.SpinLock), and an allocation can fail with an "out of memory"
+// panic if the heap is full (the packet is then dropped). While a garbage
+// collection is in progress packets take the workqueue path instead.
 // Interfaces are unregistered automatically at module exit.
 package netdev
 
@@ -50,6 +55,9 @@ type Interface struct {
 	Driver Driver
 	// MTU defaults to 1500.
 	MTU int
+	// AtomicTransmit runs Transmit directly in the transmit path; see the
+	// package documentation.
+	AtomicTransmit bool
 
 	ptr    uintptr
 	handle kernel.Handle
@@ -58,7 +66,10 @@ type Interface struct {
 // Implemented in the netdev glue (gokm/frameworks/netdev/netdev.c).
 //
 //export gokm_netdev_create
-func cCreate(name *byte, mtu int, handle uintptr, out *uintptr, outName *byte) int
+func cCreate(name *byte, mtu int, atomicXmit bool, handle uintptr, out *uintptr, outName *byte) int
+
+//export gokm_netdev_stats
+func cStats(ptr uintptr, direct, deferred *uint64)
 
 //export gokm_netdev_destroy
 func cDestroy(ptr uintptr)
@@ -81,7 +92,7 @@ func Register(i *Interface) error {
 	i.handle = kernel.NewHandle(i)
 	name := i.Name + "\x00"
 	var assigned [16]byte
-	if rc := cCreate(unsafe.StringData(name), i.MTU, uintptr(i.handle), &i.ptr, &assigned[0]); rc != 0 {
+	if rc := cCreate(unsafe.StringData(name), i.MTU, i.AtomicTransmit, uintptr(i.handle), &i.ptr, &assigned[0]); rc != 0 {
 		i.handle.Delete()
 		i.ptr = 0
 		return kernel.Errno(-rc)
@@ -106,6 +117,15 @@ func (i *Interface) Receive(pkt []byte) error {
 		return kernel.EINVAL
 	}
 	return errOf(cRx(i.ptr, &pkt[0], len(pkt)))
+}
+
+// TransmitStats returns how many packets Transmit got directly in the
+// transmit path (AtomicTransmit) and how many through the workqueue.
+func (i *Interface) TransmitStats() (direct, deferred uint64) {
+	if i.ptr != 0 {
+		cStats(i.ptr, &direct, &deferred)
+	}
+	return
 }
 
 // Unregister removes the interface.

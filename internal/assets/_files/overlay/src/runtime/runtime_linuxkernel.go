@@ -6,18 +6,17 @@
 // The kernel-side half lives in kmod/shim.c: every function below declared
 // with //export and no body is implemented there.
 //
-// Memory: the target uses TinyGo's conservative mark/sweep GC (gc_blocks.go).
-// The heap is a single vzalloc() region the shim allocates at module load
-// (size: module parameter heap_size) and frees at unload. The GC scans:
-//   - globals: compiler-generated root tables (gc_globals_blocks.go)
-//   - the stack: from the current SP up to stackTop, the frame address of
-//     the C function that first entered Go on this task, so every Go frame
-//     lies below it
-//   - callee-saved registers: spilled by tinygo_scanCurrentStack (shim.c)
-//   - parked tasks (blocked in a kernel call made for Go, Go lock released):
-//     their stacks and spilled registers, via tinygo_kmod_markrange
+// Scheduling: TinyGo's threads scheduler, with goroutines as kernel threads
+// (internal/task/task_linuxkernel.go, kmod/threads.c).
+// Memory: gokm's own collector over growable kernel memory
+// (gc_linuxkernel.go, kmod/heap.c).
 
 package runtime
+
+import (
+	"internal/task"
+	"unsafe"
+)
 
 const zeroSizeAllocPtr uintptr = 16
 
@@ -35,8 +34,9 @@ func kmodKtimeNs() int64
 //export gokm_msleep
 func kmodMsleep(ms uint32)
 
-// putchar is used by the runtime's println/panic output. Bytes are collected
-// into a line buffer and handed to printk one full line at a time.
+// putchar is used by the runtime's println/panic output (serialized by the
+// runtime's print lock). Bytes are collected into a line buffer and handed
+// to printk one full line at a time.
 var lineBuf [256]byte
 var lineLen int
 
@@ -98,45 +98,32 @@ func sleepTicks(d timeUnit) {
 	kmodMsleep(uint32(ms))
 }
 
-// GC heap and stack bounds (normally provided by the linker on baremetal
-// targets; gokm excludes baremetal_memory.go for this target).
-var heapStart, heapEnd uintptr
+// stackTop is only used by the threads scheduler's run(), which gokm
+// doesn't call (stacks are tracked per task in kmod/threads.c).
 var stackTop uintptr
 
-// The heap can't grow: it's one fixed vzalloc() region. When it's full and a
-// collection doesn't free enough, allocation fails with "out of memory".
-func growHeap() bool { return false }
-
-// Hooks for shim.c's Go lock (see gokm_enter/gokm_park there). Several
-// tasks can have Go frames on their stacks, but only the one holding the Go
-// lock runs Go code; the shim sets stackTop to that task's stack top each time
-// a task takes the lock.
-
-//export tinygo_kmod_set_stack_top
-func kmodSetStackTop(top uintptr) {
-	stackTop = top
+//export tinygo_kmod_task_size
+func kmodTaskSize() uintptr {
+	return unsafe.Sizeof(task.Task{})
 }
 
-//export tinygo_kmod_flush
-func kmodFlush() {
-	if lineLen > 0 {
-		flushLine()
-	}
-}
-
-// tinygo_kmod_markrange lets the shim mark roots outside the running stack:
-// the stacks and saved registers of parked tasks.
+// tinygo_kmod_panic_blocking is called by the C runtime when Go code tries
+// to block (sleep, wait on a mutex or channel, park) in atomic context.
 //
-//export tinygo_kmod_markrange
-func kmodMarkRange(start, end uintptr) {
-	if start < end {
-		markRoots(start, end)
-	}
+//export tinygo_kmod_panic_blocking
+func kmodPanicBlocking() {
+	runtimePanic(plainError("blocking operation in atomic context (Go mutex, channel, sleep or blocking kernel call)"))
 }
+
+//export gokm_goexit
+func kmodGoexit()
 
 // Entry points called from shim.c, between gokm_enter and gokm_leave.
 
-var kmodExitHooks []func()
+var (
+	kmodExitHooks     []func()
+	kmodExitHooksLock task.Mutex
+)
 
 // kmodInitErr is the (positive) errno module init fails with, set through
 // kernel.FailLoad.
@@ -147,11 +134,11 @@ var kmodInitErr int
 // negative errno for insmod.
 //
 //export tinygo_kmod_init
-func tinygo_kmod_init(heap, heapSize uintptr) int {
-	heapStart = heap
-	heapEnd = heap + heapSize
+func tinygo_kmod_init(heapSize, heapMax uintptr) int {
+	if !gcInit(heapSize, heapMax) {
+		return -12 // ENOMEM
+	}
 	initRand()
-	initHeap()
 	initAll()
 	callMain()
 	return -kmodInitErr
@@ -160,16 +147,26 @@ func tinygo_kmod_init(heap, heapSize uintptr) int {
 //export tinygo_kmod_exit
 func tinygo_kmod_exit() {
 	// Last registered runs first (like defer).
-	for i := len(kmodExitHooks) - 1; i >= 0; i-- {
-		kmodExitHooks[i]()
+	for {
+		kmodExitHooksLock.Lock()
+		n := len(kmodExitHooks)
+		if n == 0 {
+			kmodExitHooksLock.Unlock()
+			return
+		}
+		fn := kmodExitHooks[n-1]
+		kmodExitHooks = kmodExitHooks[:n-1]
+		kmodExitHooksLock.Unlock()
+		fn()
 	}
-	kmodExitHooks = nil
 }
 
 // kmodAddExit registers fn to run when the module is unloaded. It's exposed
 // to the kernel package via go:linkname.
 func kmodAddExit(fn func()) {
+	kmodExitHooksLock.Lock()
 	kmodExitHooks = append(kmodExitHooks, fn)
+	kmodExitHooksLock.Unlock()
 }
 
 // kmodSetInitError makes module init fail with the given positive errno once

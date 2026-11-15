@@ -2,28 +2,20 @@
 
 package interrupt
 
-// State is the saved RFLAGS value from local_irq_save().
+// Go code in a gokm module never runs in hard-interrupt context, so there is
+// nothing to disable: TinyGo uses Disable/Restore to guard data shared with
+// Go interrupt handlers (e.g. around channel locks). Disabling hardware
+// interrupts there would only prevent the code inside from blocking.
+// (Data shared with atomic-context Go code needs kernel.SpinLock.)
+
+// State is unused.
 type State uintptr
 
-//export gokm_irq_save
-func irqSave() uintptr
+// Disable does nothing.
+func Disable() (state State) { return 0 }
 
-//export gokm_irq_restore
-func irqRestore(flags uintptr)
+// Restore does nothing.
+func Restore(state State) {}
 
-// Disable disables interrupts on the local CPU (local_irq_save) and returns
-// the previous state.
-func Disable() (state State) {
-	return State(irqSave())
-}
-
-// Restore restores the interrupt state returned by Disable.
-func Restore(state State) {
-	irqRestore(uintptr(state))
-}
-
-// In reports whether we're running in interrupt context. Go code in this
-// module is only ever called from process context.
-func In() bool {
-	return false
-}
+// In reports whether we're in an interrupt handler: never.
+func In() bool { return false }

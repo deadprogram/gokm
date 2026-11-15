@@ -36,13 +36,14 @@ qemu: gokm
 	mkdir -p _qemu
 	$(call qemu_test,hello,examples/hello,,,"goodbye after")
 	$(call qemu_test,gcstress,examples/gcstress,-heap-size 256K,,"gcstress: OK" "list still intact at exit")
-	$(call qemu_test,gofs,examples/gofs,-heap-size 8M,TEST_PROG=examples/gofs/fstest,"fstest: ok   remount is a fresh")
-	$(call qemu_test,devices,examples/devices,,TEST_PROG=examples/devices/devtest,"devtest: ok   /proc/gorev reset")
-	$(call qemu_test,gonet,examples/gonet,,TEST_PROG=examples/gonet/nettest,"nettest: ok   /proc/goecho counters")
+	$(call qemu_test,gofs,examples/gofs,-heap-size 8M -heap-max 8M,TEST_PROG=examples/gofs/fstest,"fstest: ok   rename" "fstest: ok   symlinks" "fstest: ok   remount is a fresh")
+	$(call qemu_test,devices,examples/devices,,TEST_PROG=examples/devices/devtest,"devtest: ok   ioctls")
+	$(call qemu_test,gonet,examples/gonet,,TEST_PROG=examples/gonet/nettest,"nettest: ok   UDP flood" "nettest: ok   /proc/goecho counters")
 	$(call qemu_test,sysinfo,examples/sysinfo,,TEST_PROG=examples/sysinfo/infotest,"infotest: PASS")
 	$(call qemu_test,failload,test/fixtures/failload,,EXPECT_LOAD_ERRNO=ENODEV,)
 	$(call qemu_test,nested,test/fixtures/nested,-heap-size 256K,,"nested: OK")
 	$(call qemu_test,parked,test/fixtures/parked,-heap-size 256K,TEST_PROG=test/fixtures/parked/parkedtest,"parkedtest: PASS")
+	$(call qemu_test,concurrency,test/fixtures/concurrency,-heap-size 256K -heap-max 64M,TEST_PROG=test/fixtures/concurrency/conctest,"conctest: ok   blocking in atomic context")
 	@! grep -l "exit hook ran" _qemu/failload.log
 	@! grep -lE "BUG:|Oops|WARNING:|Call Trace" _qemu/*.log
 	@echo "all QEMU tests passed (logs in _qemu/)"

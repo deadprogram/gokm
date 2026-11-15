@@ -26,6 +26,8 @@
 #include <linux/string.h>
 #include <linux/compiler.h>
 #include <linux/objtool.h>
+#include <linux/interrupt.h>
+#include <linux/cpumask.h>
 
 #include "gokm.h"
 
@@ -33,198 +35,29 @@
  * GOKM_DEFAULT_HEAP_SIZE, ... */
 #include "modinfo.h"
 
-/* ---- Go GC heap ------------------------------------------------------- */
+/* ---- Go GC heap parameters ----------------------------------------- */
 
 static char *heap_size = GOKM_DEFAULT_HEAP_SIZE;
 module_param(heap_size, charp, 0444);
 MODULE_PARM_DESC(heap_size,
-		 "Size of the garbage-collected Go heap (e.g. 512K, 4M; default "
+		 "Initial size of the garbage-collected Go heap (e.g. 512K, 4M; default "
 		 GOKM_DEFAULT_HEAP_SIZE ")");
+
+static char *heap_max = GOKM_DEFAULT_HEAP_MAX;
+module_param(heap_max, charp, 0444);
+MODULE_PARM_DESC(heap_max,
+		 "Maximum size the Go heap can grow to (default " GOKM_DEFAULT_HEAP_MAX ")");
 
 #define GOKM_MIN_HEAP_SIZE (64UL * 1024)
 
-static void *gokm_heap;
-static unsigned long gokm_heap_bytes;
-
-/* ---- Entering Go, parking, and GC stack scanning --------------------- */
-
 /*
- * The Go runtime is single-threaded, so Go code only runs while holding one
- * lock, the "Go lock" (like Python's GIL).
- *
- * Every task that has Go frames on its stack has a struct gokm_thread (living
- * in the frame of its outermost GOKM_ENTER) on gokm_threads. A thread is
- * either *running* (it holds the Go lock; at most one) or *parked*: it called
- * from Go into C that released the lock around a blocking kernel call
- * (GOKM_PARK), so other threads can run Go meanwhile. Parked threads still
- * have live Go frames, so the GC scans their stacks too.
- *
- * Entering is recursive per task: Go -> C -> Go nests without locking, and a
- * parked thread re-entering Go (a callback from inside the blocking call)
- * takes the lock again.
- *
- * Because it's a mutex, Go can only be entered from process context (never
- * from interrupts, softirqs, RCU callbacks or with spinlocks held). Lock
- * order: take kernel locks before entering Go, never the other way round.
- */
-static DEFINE_MUTEX(gokm_go_lock);
-static LIST_HEAD(gokm_threads);		/* changed under go_lock + threads_lock */
-static DEFINE_SPINLOCK(gokm_threads_lock);
-
-static struct gokm_thread *gokm_find_thread(void)
-{
-	struct gokm_thread *t, *found = NULL;
-
-	spin_lock(&gokm_threads_lock);
-	list_for_each_entry(t, &gokm_threads, list) {
-		if (t->task == current) {
-			found = t;
-			break;
-		}
-	}
-	spin_unlock(&gokm_threads_lock);
-	return found;
-}
-
-static void gokm_lock_go(struct gokm_thread *t)
-{
-	mutex_lock(&gokm_go_lock);
-	t->running = true;
-	tinygo_kmod_set_stack_top(t->top);
-}
-
-static void gokm_unlock_go(struct gokm_thread *t)
-{
-	tinygo_kmod_flush();
-	t->running = false;
-	mutex_unlock(&gokm_go_lock);
-}
-
-void gokm_enter(struct gokm_entry *e, unsigned long stack_top)
-{
-	struct gokm_thread *t;
-
-	might_sleep();
-	t = gokm_find_thread();
-	if (!t) {
-		/* Outermost entry on this task. */
-		t = &e->thread;
-		t->task = current;
-		t->top = stack_top;
-		t->park_sp = 0;
-		e->kind = GOKM_ENTRY_OUTER;
-		gokm_lock_go(t);
-		spin_lock(&gokm_threads_lock);
-		list_add(&t->list, &gokm_threads);
-		spin_unlock(&gokm_threads_lock);
-	} else if (t->running) {
-		e->kind = GOKM_ENTRY_NESTED;	/* Go -> C -> Go */
-	} else {
-		e->kind = GOKM_ENTRY_REENTRY;	/* callback while parked */
-		gokm_lock_go(t);
-	}
-	e->t = t;
-}
-
-void gokm_leave(struct gokm_entry *e)
-{
-	struct gokm_thread *t = e->t;
-
-	switch (e->kind) {
-	case GOKM_ENTRY_OUTER:
-		spin_lock(&gokm_threads_lock);
-		list_del(&t->list);
-		spin_unlock(&gokm_threads_lock);
-		gokm_unlock_go(t);
-		break;
-	case GOKM_ENTRY_REENTRY:
-		gokm_unlock_go(t);	/* back to parked */
-		break;
-	case GOKM_ENTRY_NESTED:
-		break;
-	}
-}
-
-/*
- * Park: called by C that Go called, around a kernel call that may block or
- * call back into Go from another task. Spills the callee-saved registers
- * (which may hold Go pointers of the frames above) where the GC can see
- * them, and records how far down the stack Go-relevant data reaches.
- */
-void gokm_park(struct gokm_park_state *p)
-{
-	struct gokm_thread *t = gokm_find_thread();
-
-	if (WARN_ONCE(!t || !t->running, "gokm: GOKM_PARK outside of Go\n")) {
-		p->t = NULL;
-		return;
-	}
-	p->t = t;
-	p->saved_sp = t->park_sp;
-	memcpy(p->saved_regs, t->regs, sizeof(t->regs));
-
-	asm volatile("movq %%rbx,  0(%0)\n\t"
-		     "movq %%rbp,  8(%0)\n\t"
-		     "movq %%r12, 16(%0)\n\t"
-		     "movq %%r13, 24(%0)\n\t"
-		     "movq %%r14, 32(%0)\n\t"
-		     "movq %%r15, 40(%0)\n\t"
-		     : : "r"(t->regs) : "memory");
-	t->park_sp = (unsigned long)__builtin_frame_address(0);
-	gokm_unlock_go(t);
-}
-STACK_FRAME_NON_STANDARD(gokm_park);
-
-void gokm_unpark(struct gokm_park_state *p)
-{
-	struct gokm_thread *t = p->t;
-
-	if (!t)
-		return;
-	gokm_lock_go(t);
-	t->park_sp = p->saved_sp;
-	memcpy(t->regs, p->saved_regs, sizeof(t->regs));
-}
-
-/*
- * Called by the Go GC (gc_stack_raw.go) at the start of the mark phase, on
- * the running thread. It spills this thread's callee-saved registers so
- * pointers held only in registers are seen, scans this stack from here up to
- * its stack top, then scans every parked thread's stack and saved registers.
- * Caller-saved registers hold nothing live across calls by the ABI.
+ * Called by the Go GC (TinyGo's gc_stack_threads.go) at the start of the
+ * mark phase. Not used by gokm's collector, which calls gokm_scan_stacks().
  */
 void tinygo_scanCurrentStack(void)
 {
-	struct gokm_thread *t;
-	unsigned long regs[6];
-
-	asm volatile("movq %%rbx,  0(%0)\n\t"
-		     "movq %%rbp,  8(%0)\n\t"
-		     "movq %%r12, 16(%0)\n\t"
-		     "movq %%r13, 24(%0)\n\t"
-		     "movq %%r14, 32(%0)\n\t"
-		     "movq %%r15, 40(%0)\n\t"
-		     : : "r"(regs) : "memory");
-	tinygo_scanstack((unsigned long)regs);
-
-	/* The list only changes under the Go lock, which we hold. */
-	list_for_each_entry(t, &gokm_threads, list) {
-		if (t->running)
-			continue;
-		tinygo_kmod_markrange((unsigned long)t->regs,
-				      (unsigned long)(t->regs + ARRAY_SIZE(t->regs)));
-		if (t->park_sp && t->park_sp < t->top)
-			tinygo_kmod_markrange(t->park_sp, t->top);
-	}
-	/* Keep regs alive across the calls (no tail call). */
-	asm volatile("" : : "r"(regs) : "memory");
+	gokm_scan_stacks();
 }
-/*
- * objtool sees callee-saved registers stored to the stack and never restored,
- * and reports a modified stack frame. That's intended: the copies are only
- * there for the GC to read.
- */
-STACK_FRAME_NON_STANDARD(tinygo_scanCurrentStack);
 
 /* ---- recover() support ------------------------------------------------ */
 
@@ -264,7 +97,7 @@ struct gokm_alloc_hdr {
 };
 
 static LIST_HEAD(gokm_allocs);
-static DEFINE_MUTEX(gokm_allocs_lock);
+static DEFINE_SPINLOCK(gokm_allocs_lock);
 
 void *gokm_alloc(size_t size)
 {
@@ -272,13 +105,16 @@ void *gokm_alloc(size_t size)
 
 	if (size > SIZE_MAX - sizeof(*h))
 		return NULL;
-	h = kvzalloc(sizeof(*h) + size, GFP_KERNEL);
+	if (gokm_can_block())
+		h = kvzalloc(sizeof(*h) + size, GFP_KERNEL);
+	else
+		h = kzalloc(sizeof(*h) + size, GFP_ATOMIC);
 	if (!h)
 		return NULL;
 	h->size = size;
-	mutex_lock(&gokm_allocs_lock);
+	spin_lock_bh(&gokm_allocs_lock);
 	list_add(&h->list, &gokm_allocs);
-	mutex_unlock(&gokm_allocs_lock);
+	spin_unlock_bh(&gokm_allocs_lock);
 	return h + 1;
 }
 
@@ -286,7 +122,7 @@ void gokm_free(void *ptr)
 {
 	struct gokm_alloc_hdr *h, *found = NULL;
 
-	mutex_lock(&gokm_allocs_lock);
+	spin_lock_bh(&gokm_allocs_lock);
 	list_for_each_entry(h, &gokm_allocs, list) {
 		if (h + 1 == ptr) {
 			found = h;
@@ -294,7 +130,7 @@ void gokm_free(void *ptr)
 			break;
 		}
 	}
-	mutex_unlock(&gokm_allocs_lock);
+	spin_unlock_bh(&gokm_allocs_lock);
 
 	if (WARN_ONCE(!found, "kernel.FreeBytes: %px was not returned by AllocBytes (or already freed)\n", ptr))
 		return;
@@ -305,15 +141,16 @@ static void gokm_free_all(void)
 {
 	struct gokm_alloc_hdr *h, *tmp;
 	size_t n = 0, bytes = 0;
+	LIST_HEAD(all);
 
-	mutex_lock(&gokm_allocs_lock);
-	list_for_each_entry_safe(h, tmp, &gokm_allocs, list) {
-		list_del(&h->list);
+	spin_lock_bh(&gokm_allocs_lock);
+	list_splice_init(&gokm_allocs, &all);
+	spin_unlock_bh(&gokm_allocs_lock);
+	list_for_each_entry_safe(h, tmp, &all, list) {
 		bytes += h->size;
 		n++;
 		kvfree(h);
 	}
-	mutex_unlock(&gokm_allocs_lock);
 	if (n)
 		pr_debug("freed %zu leftover AllocBytes buffers (%zu bytes)\n", n, bytes);
 }
@@ -338,12 +175,29 @@ s64 gokm_ktime_ns(void)
 	return ktime_get_ns();
 }
 
-/* time.Sleep: other threads may run Go while this one sleeps. */
-void gokm_msleep(unsigned int ms)
+void gokm_bh_disable(void)
 {
-	GOKM_PARK();
-	msleep(ms);
-	GOKM_UNPARK();
+	local_bh_disable();
+}
+
+void gokm_bh_enable(void)
+{
+	local_bh_enable();
+}
+
+void gokm_cpu_relax(void)
+{
+	cpu_relax();
+}
+
+long gokm_num_cpus(void)
+{
+	return num_online_cpus();
+}
+
+void gokm_yield(void)
+{
+	cond_resched();
 }
 
 unsigned long gokm_irq_save(void)
@@ -361,37 +215,50 @@ void gokm_irq_restore(unsigned long flags)
 
 /* ---- Module init/exit ------------------------------------------------ */
 
+static void gokm_teardown(void)
+{
+	gokm_threads_stop();		/* goroutines */
+	gokm_gc_worker_stop();
+	gokm_free_all();		/* AllocBytes leftovers */
+	gokm_chunks_free_all();		/* the Go heap */
+}
+
 static int __init gokm_init(void)
 {
 	unsigned long size = memparse(heap_size, NULL);
+	unsigned long max = memparse(heap_max, NULL);
 	int ret;
 
 	size = max(PAGE_ALIGN(size), GOKM_MIN_HEAP_SIZE);
-	gokm_heap = vzalloc(size);
-	if (!gokm_heap) {
-		pr_err("can't allocate %lu byte Go heap\n", size);
-		return -ENOMEM;
-	}
-	gokm_heap_bytes = size;
+	max = max(PAGE_ALIGN(max), size);
+	gokm_threads_init();
 
-	GOKM_ENTER();
-	ret = tinygo_kmod_init((unsigned long)gokm_heap, size);
-	GOKM_LEAVE();
-	if (ret) {
-		/* Load failed (kernel.FailLoad): exit hooks don't run. */
-		gokm_free_all();
-		vfree(gokm_heap);
+	{
+		GOKM_ENTER();
+		if (tinygo_kmod_task_size() > GOKM_TASK_BYTES) {
+			pr_err("Go task.Task (%lu bytes) doesn't fit GOKM_TASK_BYTES\n",
+			       tinygo_kmod_task_size());
+			ret = -EINVAL;
+		} else {
+			ret = tinygo_kmod_init(size, max);
+		}
+		GOKM_LEAVE();
 	}
+	if (!ret)
+		ret = gokm_gc_worker_start();
+	if (ret)
+		gokm_teardown();	/* load failed: exit hooks don't run */
 	return ret;
 }
 
 static void __exit gokm_exit(void)
 {
-	GOKM_ENTER();
-	tinygo_kmod_exit();
-	GOKM_LEAVE();
-	gokm_free_all();
-	vfree(gokm_heap);
+	{
+		GOKM_ENTER();
+		tinygo_kmod_exit();
+		GOKM_LEAVE();
+	}
+	gokm_teardown();
 }
 
 module_init(gokm_init);

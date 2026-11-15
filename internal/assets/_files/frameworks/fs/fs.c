@@ -36,6 +36,11 @@ s64 gokm_fs_go_read(unsigned long m, u64 ino, void *buf, long count, s64 off);
 s64 gokm_fs_go_write(unsigned long m, u64 ino, const void *buf, long count, s64 off);
 long gokm_fs_go_truncate(unsigned long m, u64 ino, s64 size);
 long gokm_fs_go_iterate(unsigned long m, u64 dir, s64 start, unsigned long ctx);
+long gokm_fs_go_rename(unsigned long m, u64 old_dir, const unsigned char *old_name, long old_len,
+		       u64 new_dir, const unsigned char *new_name, long new_len);
+s64 gokm_fs_go_symlink(unsigned long m, u64 dir, const unsigned char *name, long len,
+		       const char *target, long target_len);
+long gokm_fs_go_readlink(unsigned long m, u64 ino, const char **buf, long *len);
 
 /* Called from Go. */
 long gokm_fs_register(const char *name, long len, u32 magic, unsigned long handle,
@@ -49,7 +54,7 @@ struct gokm_fs_type {
 	u32 magic;
 };
 
-static const struct inode_operations gokm_fs_dir_iops, gokm_fs_file_iops;
+static const struct inode_operations gokm_fs_dir_iops, gokm_fs_file_iops, gokm_fs_symlink_iops;
 static const struct file_operations gokm_fs_dir_fops, gokm_fs_file_fops;
 static const struct super_operations gokm_fs_sops;
 
@@ -72,7 +77,7 @@ static int gokm_fs_refresh(struct inode *inode, bool init)
 		return err;
 	if (init)
 		inode->i_mode = mode;
-	if (S_ISREG(inode->i_mode))
+	if (S_ISREG(inode->i_mode) || S_ISLNK(inode->i_mode))
 		i_size_write(inode, size);
 	return 0;
 }
@@ -98,6 +103,9 @@ static struct inode *gokm_fs_iget(struct super_block *sb, u64 ino)
 		inode->i_op = &gokm_fs_dir_iops;
 		inode->i_fop = &gokm_fs_dir_fops;
 		set_nlink(inode, 2);
+	} else if (S_ISLNK(inode->i_mode)) {
+		inode->i_op = &gokm_fs_symlink_iops;
+		set_nlink(inode, 1);
 	} else {
 		inode->i_op = &gokm_fs_file_iops;
 		inode->i_fop = &gokm_fs_file_fops;
@@ -195,6 +203,82 @@ static int gokm_fs_unlink(struct inode *dir, struct dentry *dentry)
 static int gokm_fs_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	return gokm_fs_remove(dir, dentry, true);
+}
+
+static int gokm_fs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+			  struct dentry *old_dentry, struct inode *new_dir,
+			  struct dentry *new_dentry, unsigned int flags)
+{
+	struct inode *target = d_inode(new_dentry);
+	long err;
+
+	/* RENAME_NOREPLACE is checked by the VFS; exchange/whiteout aren't supported. */
+	if (flags & ~RENAME_NOREPLACE)
+		return -EINVAL;
+
+	GOKM_ENTER();
+	err = gokm_fs_go_rename(gokm_fs_mount(old_dir->i_sb), old_dir->i_ino,
+				old_dentry->d_name.name, old_dentry->d_name.len,
+				new_dir->i_ino, new_dentry->d_name.name, new_dentry->d_name.len);
+	GOKM_LEAVE();
+	if (err)
+		return err;
+
+	if (target) {
+		inode_set_ctime_current(target);
+		clear_nlink(target);	/* replaced: evicted on last iput */
+	}
+	inode_set_mtime_to_ts(old_dir, inode_set_ctime_current(old_dir));
+	inode_set_mtime_to_ts(new_dir, inode_set_ctime_current(new_dir));
+	inode_set_ctime_current(d_inode(old_dentry));
+	return 0;
+}
+
+static int gokm_fs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			   struct dentry *dentry, const char *target)
+{
+	struct inode *inode;
+	s64 ino;
+
+	GOKM_ENTER();
+	ino = gokm_fs_go_symlink(gokm_fs_mount(dir->i_sb), dir->i_ino,
+				 dentry->d_name.name, dentry->d_name.len,
+				 target, strlen(target));
+	GOKM_LEAVE();
+	if (ino < 0)
+		return ino;
+
+	inode = gokm_fs_iget(dir->i_sb, ino);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	inode_init_owner(idmap, inode, dir, S_IFLNK | 0777);
+	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
+static const char *gokm_fs_get_link(struct dentry *dentry, struct inode *inode,
+				    struct delayed_call *done)
+{
+	const char *buf = NULL;
+	char *copy = NULL;
+	long len = 0, err;
+
+	if (!dentry)
+		return ERR_PTR(-ECHILD);	/* RCU walk: retry in ref-walk mode */
+
+	GOKM_ENTER();
+	err = gokm_fs_go_readlink(gokm_fs_mount(inode->i_sb), inode->i_ino, &buf, &len);
+	if (!err) {
+		copy = kmemdup_nul(buf ? buf : "", len, GFP_KERNEL);
+		if (!copy)
+			err = -ENOMEM;
+	}
+	GOKM_LEAVE();
+	if (err)
+		return ERR_PTR(err);
+	set_delayed_call(done, kfree_link, copy);
+	return copy;
 }
 
 bool gokm_fs_emit(unsigned long ctxp, const char *name, long len, u64 ino, u32 dtype)
@@ -332,12 +416,19 @@ static const struct inode_operations gokm_fs_dir_iops = {
 	.mkdir		= gokm_fs_mkdir,
 	.unlink		= gokm_fs_unlink,
 	.rmdir		= gokm_fs_rmdir,
+	.rename		= gokm_fs_rename,
+	.symlink	= gokm_fs_symlink,
 	.setattr	= gokm_fs_setattr,
 	.getattr	= simple_getattr,
 };
 
 static const struct inode_operations gokm_fs_file_iops = {
 	.setattr	= gokm_fs_setattr,
+	.getattr	= simple_getattr,
+};
+
+static const struct inode_operations gokm_fs_symlink_iops = {
+	.get_link	= gokm_fs_get_link,
 	.getattr	= simple_getattr,
 };
 

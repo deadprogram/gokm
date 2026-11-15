@@ -263,6 +263,62 @@ func main() {
 	}())
 
 	// O_NONBLOCK delete_module of an in-use module fails with EWOULDBLOCK.
+	check("rename: same dir, across dirs, replacing", func() error {
+		os.Mkdir(p("r1"), 0o755)
+		os.Mkdir(p("r2"), 0o755)
+		os.WriteFile(p("r1/a"), []byte("A"), 0o644)
+		os.WriteFile(p("r2/b"), []byte("B"), 0o644)
+		if err := os.Rename(p("r1/a"), p("r1/a2")); err != nil {
+			return err
+		}
+		if err := os.Rename(p("r1/a2"), p("r2/b")); err != nil { // replaces b
+			return err
+		}
+		if _, err := os.Stat(p("r1/a2")); !errors.Is(err, syscall.ENOENT) {
+			return fmt.Errorf("old name still there: %v", err)
+		}
+		if err := expectContent(p("r2/b"), []byte("A")); err != nil {
+			return err
+		}
+		ents, _ := os.ReadDir(p("r2"))
+		if len(ents) != 1 {
+			return fmt.Errorf("r2 has %d entries", len(ents))
+		}
+		if err := os.Rename(p("r2"), p("r3")); err != nil { // a directory
+			return err
+		}
+		if err := expectContent(p("r3/b"), []byte("A")); err != nil {
+			return err
+		}
+		os.WriteFile(p("r1/x"), nil, 0o644)
+		// os.Rename refuses directory targets itself (EEXIST): use the syscall.
+		if err := expectErrno(syscall.Rename(p("r3"), p("r1")), syscall.ENOTEMPTY); err != nil {
+			return err
+		}
+		return os.RemoveAll(p("r1"))
+	}())
+
+	check("symlinks", func() error {
+		if err := os.Symlink("r3/b", p("link")); err != nil {
+			return err
+		}
+		target, err := os.Readlink(p("link"))
+		if err != nil || target != "r3/b" {
+			return fmt.Errorf("readlink %q %v", target, err)
+		}
+		fi, err := os.Lstat(p("link"))
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 || fi.Size() != 4 {
+			return fmt.Errorf("lstat %v %v", fi.Mode(), err)
+		}
+		if err := expectContent(p("link"), []byte("A")); err != nil { // followed
+			return err
+		}
+		if err := os.Remove(p("link")); err != nil {
+			return err
+		}
+		return os.RemoveAll(p("r3"))
+	}())
+
 	check("rmmod refused while mounted", expectErrno(deleteModule("gofs"), syscall.EWOULDBLOCK))
 
 	check("umount", syscall.Unmount(mnt, 0))

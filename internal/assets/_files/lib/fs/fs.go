@@ -21,11 +21,15 @@
 // Nodes must be comparable (use pointer types): the framework maps each node
 // to an inode number. Methods return kernel.Errno values (kernel.ENOENT,
 // kernel.ENOSPC, ...) to report specific errors; other errors become EIO.
-// All methods are called holding the module's Go lock, one at a time.
+// Methods can be called concurrently from several CPUs (like HTTP handlers):
+// protect shared state with a sync.Mutex. The kernel already serializes
+// some operations (creating/removing entries in one directory, writes to
+// one file).
 package fs
 
 import (
 	"io"
+	"sync"
 	"unsafe"
 
 	"gokm/kernel"
@@ -38,11 +42,13 @@ const (
 	ModeType    Mode = 0o170000
 	ModeDir     Mode = 0o040000
 	ModeRegular Mode = 0o100000
+	ModeSymlink Mode = 0o120000
 	ModePerm    Mode = 0o7777
 )
 
 func (m Mode) IsDir() bool     { return m&ModeType == ModeDir }
 func (m Mode) IsRegular() bool { return m&ModeType == ModeRegular }
+func (m Mode) IsSymlink() bool { return m&ModeType == ModeSymlink }
 
 // Attr are a node's attributes.
 type Attr struct {
@@ -94,6 +100,22 @@ type (
 	// Truncater changes a file's size (truncate, O_TRUNC).
 	Truncater interface {
 		Truncate(size int64) error
+	}
+	// Renamer moves the entry oldName of this directory to newName in
+	// newDir (possibly the same directory), replacing what's there. The
+	// framework already checked that a replaced directory is empty and that
+	// the types match.
+	Renamer interface {
+		Rename(oldName string, newDir Dir, newName string) error
+	}
+	// Symlinker creates symbolic links in a directory. The returned node
+	// should report ModeSymlink and implement Readlinker.
+	Symlinker interface {
+		Symlink(name, target string) (Node, error)
+	}
+	// Readlinker is implemented by symbolic links.
+	Readlinker interface {
+		Readlink() (string, error)
 	}
 	// Unmounter is implemented by a root Dir that wants to know when its
 	// mount goes away.
@@ -161,6 +183,7 @@ func (f *FileSystem) Unregister() {
 
 // mount is one mounted instance: it maps nodes to inode numbers.
 type mount struct {
+	mu    sync.Mutex // protects nodes, inos, next
 	root  Dir
 	nodes map[uint64]Node
 	inos  map[nodeKey]uint64
@@ -178,6 +201,8 @@ func keyOf(n Node) nodeKey { return *(*nodeKey)(unsafe.Pointer(&n)) }
 const rootIno = 1
 
 func (m *mount) ino(n Node) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	k := keyOf(n)
 	if ino, ok := m.inos[k]; ok {
 		return ino
@@ -190,6 +215,8 @@ func (m *mount) ino(n Node) uint64 {
 }
 
 func (m *mount) forget(ino uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if n, ok := m.nodes[ino]; ok {
 		delete(m.nodes, ino)
 		delete(m.inos, keyOf(n))
@@ -198,8 +225,15 @@ func (m *mount) forget(ino uint64) {
 
 func getMount(h uintptr) *mount { return kernel.Handle(h).Value().(*mount) }
 
-func (m *mount) dir(ino uint64) (Dir, int) {
+func (m *mount) node(ino uint64) (Node, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	n, ok := m.nodes[ino]
+	return n, ok
+}
+
+func (m *mount) dir(ino uint64) (Dir, int) {
+	n, ok := m.node(ino)
 	if !ok {
 		return nil, -int(kernel.ENOENT)
 	}
@@ -208,6 +242,20 @@ func (m *mount) dir(ino uint64) (Dir, int) {
 		return nil, -int(kernel.ENOTDIR)
 	}
 	return d, 0
+}
+
+// withType fills in the type bits of a node's mode if Attr left them out.
+func withType(n Node, mode Mode) Mode {
+	if mode&ModeType != 0 {
+		return mode
+	}
+	switch n.(type) {
+	case Dir:
+		return mode | ModeDir
+	case Readlinker:
+		return mode | ModeSymlink
+	}
+	return mode | ModeRegular
 }
 
 func viewString(p *byte, n int) string { return unsafe.String(p, n) }
@@ -252,20 +300,21 @@ func goUnmount(h uintptr) {
 //export gokm_fs_go_stat
 func goStat(h uintptr, ino uint64, mode *uint32, size *int64) (rc int) {
 	defer kernel.CatchPanic(&rc)
-	n, ok := getMount(h).nodes[ino]
+	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int(kernel.ENOENT)
 	}
 	a := n.Attr()
-	if a.Mode&ModeType == 0 {
-		if _, isDir := n.(Dir); isDir {
-			a.Mode |= ModeDir
-		} else {
-			a.Mode |= ModeRegular
-		}
-	}
+	a.Mode = withType(n, a.Mode)
 	*mode = uint32(a.Mode)
 	*size = a.Size
+	if a.Mode.IsSymlink() && a.Size == 0 {
+		if rl, ok := n.(Readlinker); ok {
+			if t, err := rl.Readlink(); err == nil {
+				*size = int64(len(t))
+			}
+		}
+	}
 	return 0
 }
 
@@ -360,6 +409,83 @@ func goRemove(h uintptr, dirIno uint64, name *byte, nameLen int, isDir bool) (rc
 
 // gokm_fs_go_evict: the kernel dropped the inode of an unlinked node.
 //
+//export gokm_fs_go_rename
+func goRename(h uintptr, oldDirIno uint64, oldName *byte, oldLen int, newDirIno uint64, newName *byte, newLen int) (rc int) {
+	defer kernel.CatchPanic(&rc)
+	m := getMount(h)
+	od, errno := m.dir(oldDirIno)
+	if errno != 0 {
+		return errno
+	}
+	nd, errno := m.dir(newDirIno)
+	if errno != 0 {
+		return errno
+	}
+	r, ok := od.(Renamer)
+	if !ok {
+		return -int(kernel.EPERM)
+	}
+	nn := string(viewBytes(newName, newLen))
+	// Replacing a directory requires it to be empty.
+	if target, err := nd.Lookup(nn); err == nil && target != nil {
+		if td, ok := target.(Dir); ok {
+			empty := true
+			td.ReadDir(func(string, Node) bool { empty = false; return false })
+			if !empty {
+				return -int(kernel.ENOTEMPTY)
+			}
+		}
+	}
+	return kernel.ToErrno(r.Rename(string(viewBytes(oldName, oldLen)), nd, nn))
+}
+
+//export gokm_fs_go_symlink
+func goSymlink(h uintptr, dirIno uint64, name *byte, nameLen int, target *byte, targetLen int) (rc int64) {
+	defer kernel.CatchPanic(&rc)
+	m := getMount(h)
+	d, errno := m.dir(dirIno)
+	if errno != 0 {
+		return int64(errno)
+	}
+	sl, ok := d.(Symlinker)
+	if !ok {
+		return -int64(kernel.EPERM)
+	}
+	n, err := sl.Symlink(string(viewBytes(name, nameLen)), string(viewBytes(target, targetLen)))
+	if err != nil {
+		return int64(kernel.ToErrno(err))
+	}
+	if n == nil {
+		return -int64(kernel.EIO)
+	}
+	return int64(m.ino(n))
+}
+
+// gokm_fs_go_readlink points *buf at the link target, valid until
+// GOKM_LEAVE.
+//
+//export gokm_fs_go_readlink
+func goReadlink(h uintptr, ino uint64, buf **byte, n *int) (rc int) {
+	defer kernel.CatchPanic(&rc)
+	node, ok := getMount(h).node(ino)
+	if !ok {
+		return -int(kernel.ENOENT)
+	}
+	rl, ok := node.(Readlinker)
+	if !ok {
+		return -int(kernel.EINVAL)
+	}
+	target, err := rl.Readlink()
+	if err != nil {
+		return kernel.ToErrno(err)
+	}
+	*n = len(target)
+	if len(target) > 0 {
+		*buf = unsafe.StringData(target)
+	}
+	return 0
+}
+
 //export gokm_fs_go_evict
 func goEvict(h uintptr, ino uint64) {
 	defer kernel.CatchPanic[int](nil)
@@ -369,7 +495,7 @@ func goEvict(h uintptr, ino uint64) {
 //export gokm_fs_go_read
 func goRead(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) {
 	defer kernel.CatchPanic(&rc)
-	n, ok := getMount(h).nodes[ino]
+	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int64(kernel.ENOENT)
 	}
@@ -387,7 +513,7 @@ func goRead(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) {
 //export gokm_fs_go_write
 func goWrite(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) {
 	defer kernel.CatchPanic(&rc)
-	n, ok := getMount(h).nodes[ino]
+	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int64(kernel.ENOENT)
 	}
@@ -405,7 +531,7 @@ func goWrite(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) 
 //export gokm_fs_go_truncate
 func goTruncate(h uintptr, ino uint64, size int64) (rc int) {
 	defer kernel.CatchPanic(&rc)
-	n, ok := getMount(h).nodes[ino]
+	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int(kernel.ENOENT)
 	}
@@ -435,14 +561,7 @@ func goIterate(h uintptr, dirIno uint64, start int64, ctx uintptr) (rc int) {
 		if n == nil {
 			return true // skip: entries need a node (and inode number)
 		}
-		mode := n.Attr().Mode
-		if mode&ModeType == 0 {
-			if _, isDir := n.(Dir); isDir {
-				mode |= ModeDir
-			} else {
-				mode |= ModeRegular
-			}
-		}
+		mode := withType(n, n.Attr().Mode)
 		return cEmit(ctx, unsafe.StringData(name), len(name), m.ino(n), uint32(mode&ModeType)>>12)
 	})
 	return kernel.ToErrno(err)

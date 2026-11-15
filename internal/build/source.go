@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -208,13 +209,29 @@ func (b *builder) generateBindings(scan *sourceScan, kdir, work, genDir string, 
 		return nil, fmt.Errorf("loading BTF: %w", err)
 	}
 	g := bindgen.New(spec, exports)
+	// Names that aren't exported functions, types or enum constants: ALL_CAPS
+	// ones are macro constants, CamelCase ones static inline functions.
+	var macroNames, inlineNames []string
+	for _, n := range g.Macros(scan.names) {
+		if bindgen.IsConstName(n) {
+			macroNames = append(macroNames, n)
+		} else {
+			inlineNames = append(inlineNames, n)
+		}
+	}
 	macros := map[string]bindgen.Const{}
-	if cands := g.Macros(scan.names); len(cands) > 0 {
-		if macros, err = b.probeMacros(kdir, filepath.Join(work, "probe"), cands, scan.headers); err != nil {
+	if len(macroNames) > 0 {
+		if macros, err = b.probeMacros(kdir, filepath.Join(work, "probe"), macroNames, scan.headers); err != nil {
 			return nil, err
 		}
 	}
-	out, err := g.Generate(scan.names, macros, scan.pragmas, scan.headers)
+	inlines := map[string]*bindgen.InlineDecl{}
+	if len(inlineNames) > 0 {
+		if inlines, err = b.probeInlines(kdir, filepath.Join(work, "probe-inline"), inlineNames, scan.headers); err != nil {
+			return nil, err
+		}
+	}
+	out, err := g.Generate(scan.names, macros, inlines, scan.pragmas, scan.headers)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +243,50 @@ func (b *builder) generateBindings(scan *sourceScan, kdir, work, genDir string, 
 		return nil, err
 	}
 	return out, os.WriteFile(filepath.Join(genDir, "linux.go"), out.Go, 0o644)
+}
+
+// probeInlines finds the signatures of static inline functions: for each
+// one it compiles (with kbuild, so the kernel's flags and -g) a file taking
+// its address, which makes the compiler emit it with DWARF, and reads the
+// signature from there. Names that don't compile are left out (the
+// generator reports them).
+func (b *builder) probeInlines(kdir, dir string, goNames, headers []string) (map[string]*bindgen.InlineDecl, error) {
+	b.step("looking up static inline functions: %s", strings.Join(goNames, " "))
+	if err := os.RemoveAll(dir); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	includes := bindgen.Includes(headers)
+	var objs []string
+	for i, n := range goNames {
+		src := fmt.Sprintf("%svoid *gokm_ref_%d = (void *)&%s;\n", includes, i, bindgen.CName(n))
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("inl_%d.c", i)), []byte(src), 0o644); err != nil {
+			return nil, err
+		}
+		objs = append(objs, fmt.Sprintf("inl_%d.o", i))
+	}
+	kbuild := "obj-m := " + strings.Join(objs, " ") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "Kbuild"), []byte(kbuild), 0o644); err != nil {
+		return nil, err
+	}
+	args := append([]string{"-k", fmt.Sprintf("-j%d", runtime.NumCPU()), "-C", kdir, "M=" + dir}, objs...)
+	b.exec(exec.Command("make", args...)) // failures: names that aren't inline functions
+
+	out := map[string]*bindgen.InlineDecl{}
+	for i, n := range goNames {
+		obj := filepath.Join(dir, objs[i])
+		if !fileExists(obj) {
+			continue
+		}
+		d, err := bindgen.ParseInline(obj, bindgen.CName(n))
+		if err != nil {
+			return nil, fmt.Errorf("linux.%s: %v", n, err)
+		}
+		out[n] = d
+	}
+	return out, nil
 }
 
 // probeMacros evaluates integer macros by compiling them against the kernel

@@ -1,42 +1,38 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * gokm C interface. Project C files (in csrc/) include this to call into Go.
+ * gokm C interface. Framework glue and project C files (csrc/) include this
+ * to call into Go.
  *
  * Calling Go from C
  * -----------------
- * Export a Go function with //export and declare its prototype in C:
+ * Export a Go function with //export and declare its prototype in C. Go
+ * int/int64/uintptr are long/s64/unsigned long, int32/uint32 are s32/u32,
+ * pointers are pointers, bool is bool. Pass strings/slices as pointer+length.
  *
- *     //export myfs_lookup                        (Go)
- *     func myfsLookup(dir uint64, name *byte, n int) uint64 { ... }
+ * Wrap every call into Go in GOKM_ENTER()/GOKM_LEAVE() (same function and
+ * scope). Several tasks can run Go at the same time (on different CPUs):
+ * there is no global lock, but Go code has to reach a "transition" (return
+ * to C, a blocking call, an allocation) for the garbage collector to run.
+ *   - GOKM_ENTER() may sleep (it waits for a collection in progress): process
+ *     context only.
+ *   - In atomic context (softirq, spinlock held, ...) use the try variant:
  *
- *     u64 myfs_lookup(u64 dir, const char *name, long n);   (C)
+ *         GOKM_DECLARE_ENTRY();
+ *         if (GOKM_TRY_ENTER_ATOMIC()) {
+ *                 go_fast_path(...);   (must not block)
+ *                 GOKM_LEAVE();
+ *         } else {
+ *                 defer the work to process context
+ *         }
  *
- * Go types map to C as: int/int64/uintptr -> long/s64/unsigned long,
- * int32/uint32 -> s32/u32, *T/unsafe.Pointer -> pointer, bool -> bool.
- * Strings, slices, maps and interfaces can't cross; pass pointer + length.
- *
- * Every call into Go must be wrapped in GOKM_ENTER()/GOKM_LEAVE(), in the
- * same C function and scope:
- *
- *     GOKM_ENTER();
- *     ino = myfs_lookup(dir, name, len);
- *     GOKM_LEAVE();
- *
- * This takes the module's Go lock (Go code is single-threaded) and tells the
- * garbage collector where this stack's Go frames start. Rules:
- *   - Process context only: GOKM_ENTER() can sleep. Never use it in
- *     interrupt/softirq context, RCU callbacks or with a spinlock held.
- *   - Lock order: take kernel locks before GOKM_ENTER(), never after.
- *   - Pointers into Go memory returned by Go are only valid until
- *     GOKM_LEAVE(); after that the GC may free them.
- *   - Kernel memory that must refer to Go objects should store a
- *     kernel.Handle (an integer), not a Go pointer.
+ *   - Pointers into Go memory returned by Go stay valid until GOKM_LEAVE()
+ *     (no collection can run while this task is in Go).
+ *   - Kernel memory must not keep Go pointers: use a kernel.Handle.
  *
  * Blocking calls made on behalf of Go
  * -----------------------------------
- * C code called *from* Go that makes a kernel call which may block for long,
- * or wait for another task that needs to run Go (unregistering a device,
- * flushing work, sleeping), must release the Go lock around it:
+ * C code called *from* Go that may block (sleep, wait for another task,
+ * unregister a device, ...) must let the collector run meanwhile:
  *
  *     GOKM_PARK();
  *     unregister_netdev(dev);   (may call back into Go: that's fine)
@@ -46,10 +42,7 @@
  *
  * Calling C from Go
  * -----------------
- * Declare a body-less Go function with //export naming the C function:
- *
- *     //export myfs_register
- *     func myfsRegister() int
+ * Declare a body-less Go function with //export naming the C function.
  */
 #ifndef GOKM_H
 #define GOKM_H
@@ -60,17 +53,33 @@
 
 struct task_struct;
 
-/* Per-task Go state, see shim.c. */
+/* Room for a Go task.Task (checked against the Go side at load). */
+#define GOKM_TASK_BYTES 256
+
+/*
+ * Per-task Go state. It lives in the frame of the task's outermost
+ * GOKM_ENTER (or in per-CPU memory for atomic entries), so it's within the
+ * stack range the collector scans.
+ */
 struct gokm_thread {
-	struct list_head list;
+	struct list_head list;		/* gokm_threads */
 	struct task_struct *task;
-	unsigned long top;	/* stack top: frame of the outermost GOKM_ENTER */
-	unsigned long park_sp;	/* lowest Go-relevant address while parked */
-	unsigned long regs[6];	/* callee-saved registers spilled at park */
-	bool running;		/* holds the Go lock */
+	unsigned long top;		/* stack top: frame of the outermost entry */
+	unsigned long park_sp;		/* lowest Go-relevant address while parked */
+	unsigned long regs[6];		/* callee-saved registers spilled at park */
+	bool active;			/* running Go (counted by the entry gate) */
+	bool goroutine;			/* a kthread started by a go statement */
+	bool atomic;			/* per-CPU record for atomic entries */
+	u8 gotask[GOKM_TASK_BYTES] __aligned(16);	/* Go's task.Task */
 };
 
-enum { GOKM_ENTRY_OUTER, GOKM_ENTRY_NESTED, GOKM_ENTRY_REENTRY };
+enum {
+	GOKM_ENTRY_OUTER,	/* first entry on this task */
+	GOKM_ENTRY_NESTED,	/* Go -> C -> Go */
+	GOKM_ENTRY_REENTRY,	/* callback while parked */
+	GOKM_ENTRY_ATOMIC,	/* atomic-context entry (per-CPU record) */
+	GOKM_ENTRY_FAILED,	/* atomic try-entry that didn't enter */
+};
 
 struct gokm_entry {
 	struct gokm_thread thread;	/* used by the outermost entry */
@@ -85,13 +94,18 @@ struct gokm_park_state {
 };
 
 void gokm_enter(struct gokm_entry *e, unsigned long stack_top);
+bool gokm_enter_atomic(struct gokm_entry *e, unsigned long stack_top);
 void gokm_leave(struct gokm_entry *e);
 void gokm_park(struct gokm_park_state *p);
 void gokm_unpark(struct gokm_park_state *p);
 
+#define GOKM_FRAME() ((unsigned long)__builtin_frame_address(0))
+
+#define GOKM_DECLARE_ENTRY() struct gokm_entry __gokm_entry
 #define GOKM_ENTER()							\
-	struct gokm_entry __gokm_entry;					\
-	gokm_enter(&__gokm_entry, (unsigned long)__builtin_frame_address(0))
+	GOKM_DECLARE_ENTRY();						\
+	gokm_enter(&__gokm_entry, GOKM_FRAME())
+#define GOKM_TRY_ENTER_ATOMIC() gokm_enter_atomic(&__gokm_entry, GOKM_FRAME())
 #define GOKM_LEAVE() gokm_leave(&__gokm_entry)
 
 #define GOKM_PARK()							\
@@ -99,20 +113,47 @@ void gokm_unpark(struct gokm_park_state *p);
 	gokm_park(&__gokm_park)
 #define GOKM_UNPARK() gokm_unpark(&__gokm_park)
 
-/* ---- Internal: shim.c <-> Go runtime --------------------------------- */
+/* ---- Internal: C runtime <-> Go runtime ------------------------------ */
 
-/* Implemented in Go (overlay/src/runtime/runtime_linuxkernel.go). */
-void tinygo_kmod_set_stack_top(unsigned long stack_top);
-void tinygo_kmod_flush(void);
-void tinygo_kmod_markrange(unsigned long start, unsigned long end);
-int tinygo_kmod_init(unsigned long heap, unsigned long heap_size);
+/* Implemented in Go (overlay/src/runtime, overlay/src/internal/task). */
+int tinygo_kmod_init(unsigned long heap_size, unsigned long heap_max);
 void tinygo_kmod_exit(void);
+void tinygo_kmod_markrange(unsigned long start, unsigned long end);
+void tinygo_kmod_gc_background(void);
+unsigned long tinygo_kmod_task_size(void);
+void __noreturn tinygo_kmod_panic_blocking(void);	/* a Go panic */
+void tinygo_scanstack(unsigned long sp);	/* TinyGo's gc_stack_threads.go */
 
-/* Implemented in Go (TinyGo's gc_stack_raw.go). */
-void tinygo_scanstack(unsigned long sp);
+/* threads.c */
+void *gokm_current_task(void);
+unsigned long gokm_current_stack_top(void);
+bool gokm_can_block(void);
+bool gokm_stop_world(void);
+void gokm_start_world(void);
+void gokm_scan_stacks(void);
+long gokm_go_start(unsigned long fn, void *args);
+void gokm_goexit(void);
+long gokm_num_goroutines(void);
+void gokm_threads_init(void);
+void gokm_threads_stop(void);
+bool gokm_stopping(void);
+void tinygo_futex_wait(u32 *addr, u32 cmp);
+void tinygo_futex_wait_timeout(u32 *addr, u32 cmp, u64 timeout_ns);
+void tinygo_futex_wake(u32 *addr);
+void tinygo_futex_wake_all(u32 *addr);
 
-/* Implemented in shim.c, called from Go. */
+/* heap.c */
+unsigned long gokm_chunk_alloc(unsigned long size);
+void gokm_chunk_free(unsigned long chunk);
+void gokm_heap_lock(void);
+void gokm_heap_unlock(void);
+void gokm_gc_kick(void);
+int gokm_gc_worker_start(void);
+void gokm_gc_worker_stop(void);
+void gokm_chunks_free_all(void);
 void tinygo_scanCurrentStack(void);
+
+/* shim.c */
 void *gokm_alloc(size_t size);
 void gokm_free(void *ptr);
 void gokm_print(const char *buf, long len);
@@ -121,5 +162,10 @@ s64 gokm_ktime_ns(void);
 void gokm_msleep(unsigned int ms);
 unsigned long gokm_irq_save(void);
 void gokm_irq_restore(unsigned long flags);
+void gokm_bh_disable(void);
+void gokm_bh_enable(void);
+void gokm_cpu_relax(void);
+long gokm_num_cpus(void);
+void gokm_yield(void);
 
 #endif

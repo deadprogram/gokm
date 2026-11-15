@@ -186,10 +186,13 @@ func mirrorTinyGoRoot(sys, dst, overlay string) error {
 
 // excludedFiles are TinyGo source files (relative to the root) that would
 // otherwise build for our target but conflict with the linuxkernel runtime
-// layer. baremetal_memory.go takes heap and stack bounds from linker-script
-// symbols; in a kernel module they come from the C shim at load time.
+// layer: baremetal_memory.go takes heap and stack bounds from linker-script
+// symbols, gc_custom.go and task_threads.go are replaced by gokm's
+// collector and kernel-thread goroutines.
 var excludedFiles = []string{
 	"src/runtime/baremetal_memory.go",
+	"src/runtime/gc_custom.go",          // gokm's collector: gc_linuxkernel.go
+	"src/internal/task/task_threads.go", // kernel threads: task_linuxkernel.go
 }
 
 // excludeFromTarget replaces the symlinked file at p with a copy whose

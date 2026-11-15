@@ -43,9 +43,11 @@ type Gen struct {
 	enums map[string]int64     // C name -> value
 
 	// Set while generating.
-	typeName   map[uint32]string // type ID -> Go name, for referenced types
+	typeName   map[uint32]string    // type ID -> Go name, for generated types
+	genTypes   map[string]*btf.Type // Go name -> type to generate
 	usedNS     map[string]bool
 	needUnsafe bool
+	needBF     bool // bitfield helpers
 }
 
 // New indexes a kernel's BTF and exported symbols.
@@ -110,7 +112,8 @@ func GoName(c string) string {
 }
 
 // Macros returns the referenced names that are neither exported functions,
-// types nor enum constants: candidates to evaluate as macro constants.
+// types nor enum constants: static inline functions (probed through DWARF)
+// or macro constants (evaluated against the headers).
 func (g *Gen) Macros(names []string) []string {
 	var out []string
 	for _, n := range names {
@@ -131,9 +134,10 @@ type Const struct {
 
 // Output is the generated code.
 type Output struct {
-	Go         []byte   // package linux
-	C          []byte   // wrappers for //gokm:inline and //gokm:blocking
-	Namespaces []string // symbol namespaces to import (MODULE_IMPORT_NS)
+	Go          []byte   // package linux
+	C           []byte   // wrappers compiled with the kernel headers (inline functions, pragmas)
+	CStandalone []byte   // wrappers needing no headers (by-value structs of exported functions)
+	Namespaces  []string // symbol namespaces to import (MODULE_IMPORT_NS)
 }
 
 // Pragma is a //gokm:inline or //gokm:blocking declaration in user code.
@@ -168,18 +172,21 @@ func Includes(extra []string) string {
 }
 
 // Generate produces the gokm/linux package for the referenced names (with
-// macro values from the probe), and C wrappers for the pragmas.
-func (g *Gen) Generate(names []string, macros map[string]Const, pragmas []Pragma, headers []string) (*Output, error) {
+// macro values and inline-function signatures from the probes), and C
+// wrappers for inline functions, by-value structs and pragmas.
+func (g *Gen) Generate(names []string, macros map[string]Const, inlines map[string]*InlineDecl,
+	pragmas []Pragma, headers []string) (*Output, error) {
 	g.typeName = map[uint32]string{}
+	g.genTypes = map[string]*btf.Type{}
 	g.usedNS = map[string]bool{}
-	g.needUnsafe = false
+	g.needUnsafe, g.needBF = false, false
 	var errs []string
 
-	// Types first: functions and fields refer to them by name.
-	var typeNames []string
+	// Referenced types first: functions and fields refer to them by name.
 	for _, n := range names {
 		if t := g.types[n]; t != nil && g.funcs[n] == nil {
 			g.typeName[t.ID] = n
+			g.genTypes[n] = t
 			if t.Kind == btf.KindTypedef {
 				// Pointers to the underlying struct also get the name.
 				if u := g.spec.Skip(t.Ref); u.Kind == btf.KindStruct || u.Kind == btf.KindUnion {
@@ -188,35 +195,60 @@ func (g *Gen) Generate(names []string, macros map[string]Const, pragmas []Pragma
 					}
 				}
 			}
-			typeNames = append(typeNames, n)
 		}
 	}
 
-	var body bytes.Buffer
-	sort.Strings(typeNames)
-	for _, n := range typeNames {
-		body.WriteString(g.genType(n, g.types[n]))
-	}
-
+	// Functions (they may add the structs in their signatures).
+	var funcs, cHdr, cStd bytes.Buffer
 	var fnNames, constNames []string
 	for _, n := range names {
 		switch {
-		case g.funcs[n] != nil:
+		case g.funcs[n] != nil, inlines[n] != nil:
 			fnNames = append(fnNames, n)
 		case g.types[n] != nil:
 		default:
-			constNames = append(constNames, n)
+			if _, ok := g.enums[n]; ok || macros[n] != (Const{}) || IsConstName(n) {
+				constNames = append(constNames, n)
+			} else {
+				errs = append(errs, fmt.Sprintf("linux.%s: no exported kernel function, type, constant or "+
+					"static inline function %s (for function-like macros, declare them with //gokm:inline)", n, CName(n)))
+			}
 		}
 	}
 	sort.Strings(fnNames)
 	for _, n := range fnNames {
-		src, err := g.genFunc(n, g.funcs[n])
+		var sig *funcSig
+		var err error
+		if fn := g.funcs[n]; fn != nil {
+			sig, err = g.btfSig(n, fn)
+			if err == nil {
+				if ns := g.exports[fn.Name]; ns != "" {
+					g.usedNS[ns] = true
+				}
+			}
+		} else {
+			sig, err = g.inlineSig(n, inlines[n])
+		}
 		if err != nil {
-			errs = append(errs, err.Error())
+			errs = append(errs, fmt.Sprintf("linux.%s: %v", n, err))
 			continue
 		}
-		body.WriteString(src)
+		goSrc, ch, cs := g.genFuncCode(sig)
+		funcs.WriteString(goSrc)
+		cHdr.WriteString(ch)
+		cStd.WriteString(cs)
 	}
+
+	var body bytes.Buffer
+	typeNames := make([]string, 0, len(g.genTypes))
+	for n := range g.genTypes {
+		typeNames = append(typeNames, n)
+	}
+	sort.Strings(typeNames)
+	for _, n := range typeNames {
+		body.WriteString(g.genType(n, g.genTypes[n]))
+	}
+	body.Write(funcs.Bytes())
 
 	sort.Strings(constNames)
 	if len(constNames) > 0 {
@@ -231,21 +263,19 @@ func (g *Gen) Generate(names []string, macros map[string]Const, pragmas []Pragma
 					fmt.Fprintf(&body, "\t%s = %d // macro (unsigned)\n", n, uint64(c.Value))
 				}
 			} else {
-				errs = append(errs, fmt.Sprintf("linux.%s: no exported kernel function, type, enum constant or "+
-					"integer macro named %s (for inline functions and function-like macros, declare them with //gokm:inline)", n, n))
+				errs = append(errs, fmt.Sprintf("linux.%s: no enum constant or integer macro named %s", n, n))
 			}
 		}
 		body.WriteString(")\n\n")
 	}
 
-	var c bytes.Buffer
 	for _, p := range pragmas {
 		src, err := g.genWrapper(p)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", p.Pos, err))
 			continue
 		}
-		c.WriteString(src)
+		cHdr.WriteString(src)
 	}
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("%s", strings.Join(errs, "\n"))
@@ -257,16 +287,23 @@ func (g *Gen) Generate(names []string, macros map[string]Const, pragmas []Pragma
 	if g.needUnsafe || len(typeNames) > 0 {
 		out.WriteString("import \"unsafe\"\n\nvar _ unsafe.Pointer\n\n")
 	}
+	if g.needBF {
+		out.WriteString(bitfieldHelpers)
+	}
 	out.Write(body.Bytes())
 
 	formatted, err := format.Source(out.Bytes())
 	if err != nil {
-		return nil, fmt.Errorf("formatting generated bindings: %w", err)
+		return nil, fmt.Errorf("formatting generated bindings: %w\n%s", err, out.Bytes())
 	}
 	o := &Output{Go: formatted}
-	if c.Len() > 0 {
-		o.C = append([]byte("// Generated by gokm: wrappers for //gokm:inline and //gokm:blocking.\n"+
-			Includes(headers)+"#include \"gokm.h\"\n\n"), c.Bytes()...)
+	if cHdr.Len() > 0 {
+		o.C = append([]byte("// Generated by gokm: wrappers for static inline functions and //gokm: pragmas.\n"+
+			Includes(headers)+"#include \"gokm.h\"\n\n"), cHdr.Bytes()...)
+	}
+	if cStd.Len() > 0 {
+		o.CStandalone = append([]byte("// Generated by gokm: wrappers passing structs by value (no kernel headers).\n\n"),
+			cStd.Bytes()...)
 	}
 	for ns := range g.usedNS {
 		o.Namespaces = append(o.Namespaces, ns)
@@ -274,6 +311,29 @@ func (g *Gen) Generate(names []string, macros map[string]Const, pragmas []Pragma
 	sort.Strings(o.Namespaces)
 	return o, nil
 }
+
+const bitfieldHelpers = `func b2u(b bool) uint64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func bfLoad(p unsafe.Pointer, n uintptr) uint64 {
+	var v uint64
+	for i := uintptr(0); i < n; i++ {
+		v |= uint64(*(*byte)(unsafe.Add(p, i))) << (8 * i)
+	}
+	return v
+}
+
+func bfStore(p unsafe.Pointer, n uintptr, v uint64) {
+	for i := uintptr(0); i < n; i++ {
+		*(*byte)(unsafe.Add(p, i)) = byte(v >> (8 * i))
+	}
+}
+
+`
 
 // goType maps a BTF type to a Go type expression. ok is false for types Go
 // code can't use by value (unreferenced structs, variadic, ...).
@@ -372,27 +432,37 @@ func (g *Gen) alignOf(id uint32) uint32 {
 }
 
 type field struct {
-	name  string
-	off   uint32 // bytes
-	typ   uint32
-	cpath string
+	name    string
+	off     uint32 // bytes
+	typ     uint32
+	cpath   string
+	bitOff  uint32 // bitfields: absolute bit offset and size
+	bitSize uint32
 }
 
-// flatten lists a struct's members, descending into anonymous members (C
-// lets code access their fields directly). Bitfields are skipped.
-func (g *Gen) flatten(t *btf.Type, base uint32, prefix string, out *[]field) {
+// flatten lists a struct's or union's members, descending into anonymous
+// members (C lets code access their fields directly).
+func (g *Gen) flatten(t *btf.Type, base uint32, prefix string, fields, bitfields *[]field) {
 	for _, m := range t.Members {
 		if m.BitfieldSize != 0 || m.BitOffset%8 != 0 {
+			if m.Name != "" {
+				size := m.BitfieldSize
+				if size == 0 {
+					size = 8 * g.spec.SizeOf(m.Type)
+				}
+				*bitfields = append(*bitfields, field{name: m.Name, typ: m.Type, cpath: prefix + m.Name,
+					bitOff: base*8 + m.BitOffset, bitSize: size})
+			}
 			continue
 		}
 		off := base + m.BitOffset/8
 		if m.Name == "" {
 			if u := g.spec.Skip(m.Type); u.Kind == btf.KindStruct || u.Kind == btf.KindUnion {
-				g.flatten(u, off, prefix, out)
+				g.flatten(u, off, prefix, fields, bitfields)
 			}
 			continue
 		}
-		*out = append(*out, field{name: m.Name, off: off, typ: m.Type, cpath: prefix + m.Name})
+		*fields = append(*fields, field{name: m.Name, off: off, typ: m.Type, cpath: prefix + m.Name})
 	}
 }
 
@@ -425,18 +495,20 @@ func (g *Gen) genType(name string, t *btf.Type) string {
 		b.WriteString("\t_ [0]uint32 // C alignment\n")
 	}
 
-	var fields []field
-	if under.Kind == btf.KindStruct {
-		g.flatten(under, 0, "", &fields)
-	}
+	var fields, bitfields, overlapped []field
+	g.flatten(under, 0, "", &fields, &bitfields)
 	sort.SliceStable(fields, func(i, j int) bool { return fields[i].off < fields[j].off })
+	if under.Kind == btf.KindUnion {
+		overlapped, fields = fields, nil // all members through accessors
+	}
 
 	used := map[string]int{}
 	cur := uint32(0)
 	pad := 0
 	for _, f := range fields {
 		if f.off < cur {
-			continue // overlaps (union member after the first)
+			overlapped = append(overlapped, f) // union member after the first
+			continue
 		}
 		fsize := g.spec.SizeOf(f.typ)
 		if fsize == 0 {
@@ -464,6 +536,69 @@ func (g *Gen) genType(name string, t *btf.Type) string {
 	b.WriteString("}\n\n")
 	// Compile-time layout check.
 	fmt.Fprintf(&b, "var _ [%d - unsafe.Sizeof(%s{})]byte\nvar _ [unsafe.Sizeof(%s{}) - %d]byte\n\n", size, name, name, size)
+
+	// Accessors for members that can't be fields: overlapping ones (unions)
+	// return a pointer to the member, bitfields get a getter and a setter.
+	method := func(n string) bool {
+		if used[n] > 0 {
+			return false
+		}
+		used[n]++
+		return true
+	}
+	for _, f := range overlapped {
+		fsize := g.spec.SizeOf(f.typ)
+		gt, ok := g.goType(f.typ)
+		if !ok || gt == "" {
+			gt = fmt.Sprintf("[%d]byte", fsize)
+		}
+		mn := GoName(f.name)
+		if fsize == 0 || !method(mn) {
+			continue
+		}
+		fmt.Fprintf(&b, "// %s returns a pointer to %s (offset %d, overlapping other members).\n"+
+			"func (s *%s) %s() *%s { return (*%s)(unsafe.Add(unsafe.Pointer(s), %d)) }\n\n",
+			mn, f.cpath, f.off, name, mn, gt, gt, f.off)
+	}
+	for _, f := range bitfields {
+		gt, ok := g.goType(f.typ)
+		u := g.spec.Skip(f.typ)
+		if !ok || (u.Kind != btf.KindInt && u.Kind != btf.KindEnum && u.Kind != btf.KindEnum64) {
+			continue
+		}
+		start, shift := f.bitOff/8, f.bitOff%8
+		nbytes := (shift + f.bitSize + 7) / 8
+		mn := GoName(f.name)
+		if f.bitSize == 0 || nbytes > 8 || !method(mn) || !method("Set"+mn) {
+			continue
+		}
+		g.needBF = true
+		mask := fmt.Sprintf("(1<<%d - 1)", f.bitSize)
+		if f.bitSize == 64 {
+			mask = "^uint64(0)"
+		}
+		load := fmt.Sprintf("bfLoad(unsafe.Add(unsafe.Pointer(s), %d), %d)", start, nbytes)
+		signed := (u.Kind == btf.KindInt && u.IntEncoding&btf.IntSigned != 0) || ((u.Kind == btf.KindEnum || u.Kind == btf.KindEnum64) && u.KindFlag)
+		var get string
+		switch {
+		case gt == "bool":
+			get = fmt.Sprintf("return (%s>>%d)&%s != 0", load, shift, mask)
+		case signed:
+			get = fmt.Sprintf("return %s(int64(%s<<(64-%d)) >> (64 - %d))", gt, load, shift+f.bitSize, f.bitSize)
+		default:
+			get = fmt.Sprintf("return %s((%s >> %d) & %s)", gt, load, shift, mask)
+		}
+		val := "uint64(v)"
+		if gt == "bool" {
+			val = "b2u(v)"
+		}
+		fmt.Fprintf(&b, "// %s reads the %d-bit bitfield %s.\nfunc (s *%s) %s() %s { %s }\n\n",
+			mn, f.bitSize, f.cpath, name, mn, gt, get)
+		fmt.Fprintf(&b, "// Set%s writes the bitfield %s.\nfunc (s *%s) Set%s(v %s) {\n"+
+			"\tp := unsafe.Add(unsafe.Pointer(s), %d)\n"+
+			"\tbfStore(p, %d, bfLoad(p, %d)&^(%s<<%d) | (%s&%s)<<%d)\n}\n\n",
+			mn, f.cpath, name, mn, gt, start, nbytes, nbytes, mask, shift, val, mask, shift)
+	}
 	return b.String()
 }
 
@@ -473,41 +608,6 @@ var goKeywords = map[string]bool{
 	"goto": true, "if": true, "import": true, "interface": true, "map": true, "package": true,
 	"range": true, "return": true, "select": true, "struct": true, "switch": true, "type": true,
 	"var": true, "len": true, "cap": true, "new": true, "make": true, "string": true, "error": true,
-}
-
-func (g *Gen) genFunc(name string, fn *btf.Type) (string, error) {
-	proto := g.spec.Type(fn.Ref)
-	if proto == nil || proto.Kind != btf.KindFuncProto {
-		return "", fmt.Errorf("linux.%s: no prototype for %s", name, fn.Name)
-	}
-	var params []string
-	for i, p := range proto.Params {
-		if p.Type == 0 {
-			return "", fmt.Errorf("linux.%s: %s is variadic, which Go can't call; wrap it in C with //gokm:inline", name, fn.Name)
-		}
-		gt, ok := g.goType(p.Type)
-		if !ok || gt == "" {
-			return "", fmt.Errorf("linux.%s: parameter %d of %s is passed by value as a struct; reference the type too (linux.%s) or use //gokm:inline",
-				name, i, fn.Name, GoName(g.spec.Skip(p.Type).Name))
-		}
-		pn := p.Name
-		if pn == "" || goKeywords[pn] || pn == "unsafe" {
-			pn = fmt.Sprintf("p%d", i)
-		}
-		params = append(params, pn+" "+gt)
-	}
-	ret, ok := g.goType(proto.Ref)
-	if !ok {
-		return "", fmt.Errorf("linux.%s: %s returns a struct by value; use //gokm:inline", name, fn.Name)
-	}
-	if u := g.spec.Skip(proto.Ref); u.Kind == btf.KindStruct || u.Kind == btf.KindUnion {
-		return "", fmt.Errorf("linux.%s: %s returns a struct by value, which isn't supported", name, fn.Name)
-	}
-	if ns := g.exports[fn.Name]; ns != "" {
-		g.usedNS[ns] = true
-	}
-	return fmt.Sprintf("// %s calls the kernel function %s.\n//\n//export %s\nfunc %s(%s) %s\n\n",
-		name, fn.Name, fn.Name, name, strings.Join(params, ", "), ret), nil
 }
 
 // genWrapper writes the C function a //gokm:inline or //gokm:blocking Go

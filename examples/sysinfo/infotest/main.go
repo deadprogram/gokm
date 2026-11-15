@@ -51,6 +51,9 @@ func main() {
 	if total < 300 || total > 512 {
 		problems = append(problems, "ram_total_mib not in 300..512")
 	}
+	if field(info, "timespec") != "1.500000000" {
+		problems = append(problems, "timespec (by-value struct return)")
+	}
 	if field(info, "page_size") != "4096" {
 		problems = append(problems, "page_size")
 	}

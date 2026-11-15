@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -35,7 +36,10 @@ type Options struct {
 	KernelDir   string // kernel build dir; default /lib/modules/<KernelVer>/build
 	Description string // MODULE_DESCRIPTION; default "<module path> (gokm)"
 	Author      string // MODULE_AUTHOR; optional
-	HeapSize    string // default Go heap size (module parameter heap_size); default DefaultHeapSize
+	License     string // MODULE_LICENSE; one of Licenses (default "GPL")
+	StackLimit  string // warn about call paths using more stack than this (default 8K; "0" disables)
+	HeapSize    string // initial Go heap size (module parameter heap_size); default DefaultHeapSize
+	HeapMax     string // maximum Go heap size (module parameter heap_max); default DefaultHeapMax
 	Verbose     bool   // print commands and their full output
 	Log         io.Writer
 }
@@ -50,6 +54,14 @@ type Result struct {
 
 // DefaultHeapSize is the default size of a module's garbage-collected Go heap.
 const DefaultHeapSize = "1M"
+
+// Licenses are the MODULE_LICENSE values gokm accepts: the GPL-compatible
+// ones the kernel recognizes. gokm's runtime uses GPL-only kernel symbols,
+// so non-GPL-compatible licenses can't work.
+var Licenses = []string{"GPL", "GPL v2", "GPL and additional rights", "Dual BSD/GPL", "Dual MIT/GPL", "Dual MPL/GPL"}
+
+// DefaultHeapMax is the default limit the Go heap can grow to.
+const DefaultHeapMax = "256M"
 
 var heapSizeRe = regexp.MustCompile(`^[0-9]+[KMG]?$`)
 
@@ -98,8 +110,20 @@ func (b *builder) run() (*Result, error) {
 	if b.opts.HeapSize == "" {
 		b.opts.HeapSize = DefaultHeapSize
 	}
-	if !heapSizeRe.MatchString(b.opts.HeapSize) {
-		return nil, fmt.Errorf("invalid heap size %q: use bytes or a K/M/G suffix, e.g. 4M", b.opts.HeapSize)
+	if b.opts.License == "" {
+		b.opts.License = "GPL"
+	}
+	if !slices.Contains(Licenses, b.opts.License) {
+		return nil, fmt.Errorf("license %q not supported: use one of %q (gokm's runtime needs GPL-only kernel symbols)",
+			b.opts.License, Licenses)
+	}
+	if b.opts.HeapMax == "" {
+		b.opts.HeapMax = DefaultHeapMax
+	}
+	for _, v := range []string{b.opts.HeapSize, b.opts.HeapMax} {
+		if !heapSizeRe.MatchString(v) {
+			return nil, fmt.Errorf("invalid heap size %q: use bytes or a K/M/G suffix, e.g. 4M", v)
+		}
 	}
 
 	kdir, err := KernelBuildDir(b.opts.KernelVer, b.opts.KernelDir)
@@ -198,6 +222,33 @@ func (b *builder) run() (*Result, error) {
 		return nil, err
 	}
 
+	// Stack-usage analysis, on a separate analysis build of the object, in
+	// parallel with the rest of the pipeline.
+	type stackResult struct {
+		entries []*stackEntry
+		err     error
+	}
+	stackDone := make(chan stackResult, 1)
+	if b.opts.StackLimit != "0" {
+		go func() {
+			obj := filepath.Join(work, "go.stack.o")
+			args := append([]string{"clang"}, kernelCFlags...)
+			args = append(args, "-fstack-size-section", "-ffunction-sections", "-c", "-x", "ir", fixed, "-o", obj)
+			if out, err := exec.Command("tinygo", args...).CombinedOutput(); err != nil {
+				stackDone <- stackResult{err: fmt.Errorf("%v: %s", err, out)}
+				return
+			}
+			g, err := analyzeStack(obj, fixed, mod.Path)
+			if err != nil {
+				stackDone <- stackResult{err: err}
+				return
+			}
+			stackDone <- stackResult{entries: g.entries()}
+		}()
+	} else {
+		close(stackDone)
+	}
+
 	// 4. Link in the compiler-rt builtins the Go code needs (soft-float,
 	// 128-bit arithmetic): the kernel doesn't provide them.
 	rt, err := b.prepareRTLib(root, cache, tgVersion)
@@ -243,6 +294,10 @@ func (b *builder) run() (*Result, error) {
 	b.step("building %s.ko against %s", name, kdir)
 	if err := b.exec(exec.Command("make", "-C", kdir, "M="+kmod, "modules")); err != nil {
 		return nil, err
+	}
+
+	if r, ok := <-stackDone; ok {
+		b.reportStack(r.entries, r.err)
 	}
 
 	out := b.opts.Output
@@ -327,6 +382,45 @@ func (b *builder) frameworks(root *assets.Root, dir string, env []string) ([]str
 	return fws, nil
 }
 
+func (b *builder) reportStack(entries []*stackEntry, err error) {
+	if err != nil {
+		b.step("warning: stack analysis failed: %v", err)
+		return
+	}
+	limit := parseSize(b.opts.StackLimit)
+	if limit == 0 {
+		limit = 8 << 10
+	}
+	if b.opts.Verbose {
+		b.step("deepest Go call paths (of a 16 KiB kernel stack):")
+		for i, e := range entries {
+			if i == 5 {
+				break
+			}
+			fmt.Fprintf(b.opts.Log, "    %s\n", e.describe())
+		}
+	}
+	for _, e := range entries {
+		if e.Bytes > limit || e.Recursive {
+			b.step("warning: stack: %s", e.describe())
+		}
+	}
+}
+
+// parseSize parses sizes like 8192, 8K, 4M.
+func parseSize(s string) uint64 {
+	mult := uint64(1)
+	switch {
+	case strings.HasSuffix(s, "K"):
+		mult, s = 1<<10, strings.TrimSuffix(s, "K")
+	case strings.HasSuffix(s, "M"):
+		mult, s = 1<<20, strings.TrimSuffix(s, "M")
+	}
+	var n uint64
+	fmt.Sscanf(s, "%d", &n)
+	return n * mult
+}
+
 func (b *builder) writeKmod(root *assets.Root, proj, kmod, name, modPath string, frameworks []string,
 	gen *bindgen.Output, genRoot string) error {
 	// Drop outputs of a previous build that used a different module name.
@@ -337,11 +431,22 @@ func (b *builder) writeKmod(root *assets.Root, proj, kmod, name, modPath string,
 			}
 		}
 	}
-	for _, f := range []string{"shim.c", "gokm.h"} {
-		if err := copyFile(filepath.Join(root.Kmod, f), filepath.Join(kmod, f)); err != nil {
+	// The C runtime: shim.c, threads.c, heap.c, gokm.h.
+	var runtimeObjs []string
+	entries, err := os.ReadDir(root.Kmod)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if err := copyFile(filepath.Join(root.Kmod, n), filepath.Join(kmod, n)); err != nil {
 			return err
 		}
+		if strings.HasSuffix(n, ".c") {
+			runtimeObjs = append(runtimeObjs, strings.TrimSuffix(n, ".c")+".o")
+		}
 	}
+	sort.Strings(runtimeObjs)
 
 	// C sources: framework glue for imported gokm packages, then the
 	// project's own csrc/.
@@ -356,13 +461,18 @@ func (b *builder) writeKmod(root *assets.Root, proj, kmod, name, modPath string,
 	if len(frameworks) > 0 {
 		b.step("using frameworks: gokm/%s", strings.Join(frameworks, ", gokm/"))
 	}
-	if gen != nil && len(gen.C) > 0 {
+	if gen != nil && (len(gen.C) > 0 || len(gen.CStandalone) > 0) {
 		cdir := filepath.Join(genRoot, "c")
 		if err := os.MkdirAll(cdir, 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(cdir, "wrappers.c"), gen.C, 0o644); err != nil {
-			return err
+		for name, src := range map[string][]byte{"wrappers.c": gen.C, "byval.c": gen.CStandalone} {
+			if len(src) == 0 {
+				continue
+			}
+			if err := os.WriteFile(filepath.Join(cdir, name), src, 0o644); err != nil {
+				return err
+			}
 		}
 		objs, err := copyCSources(cdir, kmod, "gokm_gen")
 		if err != nil {
@@ -380,7 +490,7 @@ func (b *builder) writeKmod(root *assets.Root, proj, kmod, name, modPath string,
 	userObjs = append(userObjs, objs...)
 
 	kbuild := fmt.Sprintf(`obj-m := %[1]s.o
-%[1]s-y := shim.o go.o %[2]s
+%[1]s-y := %[3]s go.o %[2]s
 
 # Project C files (csrc/) can #include "gokm.h".
 ccflags-y += -I$(src)
@@ -394,7 +504,7 @@ $(obj)/go.o: $(src)/go.o_shipped FORCE
 	$(call if_changed,shipped)
 
 targets += go.o
-`, name, strings.Join(userObjs, " "))
+`, name, strings.Join(userObjs, " "), strings.Join(runtimeObjs, " "))
 
 	desc := b.opts.Description
 	if desc == "" {
@@ -402,12 +512,13 @@ targets += go.o
 	}
 	var info strings.Builder
 	info.WriteString("/* Generated by gokm. */\n")
-	info.WriteString("MODULE_LICENSE(\"GPL\");\n")
+	fmt.Fprintf(&info, "MODULE_LICENSE(%s);\n", cString(b.opts.License))
 	fmt.Fprintf(&info, "MODULE_DESCRIPTION(%s);\n", cString(desc))
 	if b.opts.Author != "" {
 		fmt.Fprintf(&info, "MODULE_AUTHOR(%s);\n", cString(b.opts.Author))
 	}
 	fmt.Fprintf(&info, "#define GOKM_DEFAULT_HEAP_SIZE %s\n", cString(b.opts.HeapSize))
+	fmt.Fprintf(&info, "#define GOKM_DEFAULT_HEAP_MAX %s\n", cString(b.opts.HeapMax))
 	if gen != nil {
 		for _, ns := range gen.Namespaces {
 			fmt.Fprintf(&info, "MODULE_IMPORT_NS(%s);\n", cString(ns))

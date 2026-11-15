@@ -24,8 +24,6 @@ type node struct {
 	label string
 }
 
-var ring [16][]byte
-
 func hold() ([]byte, error) {
 	var head *node
 	for i := 0; i < 300; i++ {
@@ -52,6 +50,7 @@ func hold() ([]byte, error) {
 }
 
 func churn() ([]byte, error) {
+	var ring [16][]byte // per call: churns run concurrently
 	sum := 0
 	for i := 0; i < 3000; i++ { // ~3 MiB of garbage through a 256K heap
 		b := make([]byte, 1024)

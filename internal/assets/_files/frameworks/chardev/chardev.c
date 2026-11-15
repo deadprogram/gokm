@@ -21,11 +21,14 @@ long gokm_chardev_go_open(unsigned long dev, unsigned long *file);
 s64 gokm_chardev_go_read(unsigned long file, void *buf, long count, s64 off);
 s64 gokm_chardev_go_write(unsigned long file, const void *buf, long count, s64 off);
 void gokm_chardev_go_release(unsigned long file);
+s64 gokm_chardev_go_ioctl(unsigned long file, u32 cmd, unsigned long arg);
 
 /* Called from Go. */
 long gokm_chardev_register(const char *name, u32 mode, unsigned long handle,
 			   unsigned long *out);
 void gokm_chardev_deregister(unsigned long ptr);
+long gokm_chardev_copy_from_user(void *dst, unsigned long uaddr, long n);
+long gokm_chardev_copy_to_user(unsigned long uaddr, const void *src, long n);
 
 struct gokm_chardev {
 	struct miscdevice misc;
@@ -103,6 +106,26 @@ static ssize_t gokm_chardev_write(struct file *file, const char __user *ubuf,
 	return n;
 }
 
+static long gokm_chardev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	s64 ret;
+
+	GOKM_ENTER();
+	ret = gokm_chardev_go_ioctl((unsigned long)file->private_data, cmd, arg);
+	GOKM_LEAVE();
+	return ret;
+}
+
+long gokm_chardev_copy_from_user(void *dst, unsigned long uaddr, long n)
+{
+	return copy_from_user(dst, (const void __user *)uaddr, n) ? -EFAULT : 0;
+}
+
+long gokm_chardev_copy_to_user(unsigned long uaddr, const void *src, long n)
+{
+	return copy_to_user((void __user *)uaddr, src, n) ? -EFAULT : 0;
+}
+
 static int gokm_chardev_release(struct inode *inode, struct file *file)
 {
 	GOKM_ENTER();
@@ -117,6 +140,8 @@ static const struct file_operations gokm_chardev_fops = {
 	.read		= gokm_chardev_read,
 	.write		= gokm_chardev_write,
 	.release	= gokm_chardev_release,
+	.unlocked_ioctl	= gokm_chardev_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
 	.llseek		= default_llseek,
 };
 

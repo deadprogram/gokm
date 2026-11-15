@@ -11,6 +11,7 @@ package main
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"gokm/kernel"
 	"gokm/netdev"
@@ -23,23 +24,25 @@ const (
 	echoPort  = 7
 )
 
+// Counters are atomic: Transmit runs concurrently with /proc reads (and,
+// with AtomicTransmit, in softirq context where a mutex can't be used).
 type echo struct {
 	iface                       *netdev.Interface
-	pings, udp, dropped, opened int
+	pings, udp, dropped, opened atomic.Int64
 }
 
-func (e *echo) Open() error { e.opened++; return nil }
+func (e *echo) Open() error { e.opened.Add(1); return nil }
 
 // Transmit gets every packet the kernel sends through goecho0 and answers
 // the ones addressed to the echo services.
 func (e *echo) Transmit(pkt []byte) {
 	if len(pkt) < 20 || pkt[0]>>4 != 4 {
-		e.dropped++ // not IPv4
+		e.dropped.Add(1) // not IPv4
 		return
 	}
 	ihl := int(pkt[0]&0x0f) * 4
 	if ihl < 20 || len(pkt) < ihl+8 {
-		e.dropped++
+		e.dropped.Add(1)
 		return
 	}
 	reply := append([]byte(nil), pkt...) // pkt is only valid during the call
@@ -49,28 +52,28 @@ func (e *echo) Transmit(pkt []byte) {
 	case protoICMP:
 		icmp := reply[ihl:]
 		if icmp[0] != 8 { // echo request
-			e.dropped++
+			e.dropped.Add(1)
 			return
 		}
 		icmp[0] = 0 // echo reply
 		icmp[2], icmp[3] = 0, 0
 		sum := checksum(icmp)
 		icmp[2], icmp[3] = byte(sum>>8), byte(sum)
-		e.pings++
+		e.pings.Add(1)
 	case protoUDP:
 		udp := reply[ihl:]
 		if dport := int(udp[2])<<8 | int(udp[3]); dport != echoPort {
-			e.dropped++
+			e.dropped.Add(1)
 			return
 		}
 		swap(udp[0:2], udp[2:4]) // ports (UDP checksum unchanged)
-		e.udp++
+		e.udp.Add(1)
 	default:
-		e.dropped++
+		e.dropped.Add(1)
 		return
 	}
 	if err := e.iface.Receive(reply); err != nil {
-		e.dropped++
+		e.dropped.Add(1)
 	}
 }
 
@@ -97,14 +100,19 @@ func checksum(b []byte) uint16 {
 
 func main() {
 	e := &echo{}
-	e.iface = &netdev.Interface{Name: "goecho%d", Driver: e}
+	// AtomicTransmit: answer packets right in the kernel's transmit path
+	// (Transmit only uses atomics, never blocks).
+	e.iface = &netdev.Interface{Name: "goecho%d", Driver: e, AtomicTransmit: true}
 	if err := netdev.Register(e.iface); err != nil {
 		kernel.FailLoad(err)
 		return
 	}
 	_, err := procfs.Create("goecho", procfs.ReadFunc(func() ([]byte, error) {
-		return []byte(fmt.Sprintf("interface: %s\nopened: %d\npings: %d\nudp: %d\ndropped: %d\n",
-			e.iface.Name, e.opened, e.pings, e.udp, e.dropped)), nil
+		direct, deferred := e.iface.TransmitStats()
+		return []byte(fmt.Sprintf("interface: %s\nopened: %d\npings: %d\nudp: %d\ndropped: %d\n"+
+			"transmit_direct: %d\ntransmit_deferred: %d\n",
+			e.iface.Name, e.opened.Load(), e.pings.Load(), e.udp.Load(), e.dropped.Load(),
+			direct, deferred)), nil
 	}))
 	if err != nil {
 		e.iface.Unregister() // exit hooks don't run when loading fails

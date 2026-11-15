@@ -3,9 +3,12 @@
  * gokm/netdev glue: point-to-point IP network devices driven by Go
  * (lib/netdev/netdev.go).
  *
- * ndo_start_xmit runs in softirq context, where Go can't run, so it only
- * queues the packet; a work item hands queued packets to Go in process
- * context. Locking: ndo_open/ndo_stop run under rtnl and then enter Go, so
+ * ndo_start_xmit runs with BH disabled (atomic context). By default it
+ * queues the packet and a work item hands queued packets to Go in process
+ * context. With AtomicTransmit, Go's Transmit runs right there instead,
+ * through an atomic try-entry; when that can't enter (a collection is in
+ * progress) or packets are already queued (keep the order), it falls back
+ * to the queue. Locking: ndo_open/ndo_stop run under rtnl and then enter Go, so
  * Go must never wait for rtnl while holding the Go lock: register/unregister
  * park (release the Go lock) first.
  */
@@ -27,8 +30,9 @@ long gokm_netdev_go_open(unsigned long h);
 long gokm_netdev_go_stop(unsigned long h);
 
 /* Called from Go. */
-long gokm_netdev_create(const char *name, long mtu, unsigned long handle,
-			unsigned long *out, char *out_name);
+long gokm_netdev_create(const char *name, long mtu, bool atomic_xmit,
+			unsigned long handle, unsigned long *out, char *out_name);
+void gokm_netdev_stats(unsigned long ptr, u64 *direct, u64 *deferred);
 void gokm_netdev_destroy(unsigned long ptr);
 long gokm_netdev_rx(unsigned long ptr, const void *pkt, long len);
 
@@ -37,11 +41,28 @@ struct gokm_netdev_priv {
 	unsigned long handle;	/* kernel.Handle of the Go Interface */
 	struct sk_buff_head txq;
 	struct work_struct tx_work;
+	bool atomic_xmit;
+	atomic64_t direct;	/* packets Go handled in the transmit path */
+	atomic64_t deferred;	/* packets handed to Go from the workqueue */
 };
 
 static netdev_tx_t gokm_netdev_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct gokm_netdev_priv *p = netdev_priv(dev);
+
+	if (p->atomic_xmit && skb_queue_empty(&p->txq) && !skb_linearize(skb)) {
+		GOKM_DECLARE_ENTRY();
+
+		if (GOKM_TRY_ENTER_ATOMIC()) {
+			DEV_STATS_INC(dev, tx_packets);
+			DEV_STATS_ADD(dev, tx_bytes, skb->len);
+			gokm_netdev_go_xmit(p->handle, skb->data, skb->len);
+			GOKM_LEAVE();
+			atomic64_inc(&p->direct);
+			consume_skb(skb);
+			return NETDEV_TX_OK;
+		}
+	}
 
 	if (skb_queue_len(&p->txq) >= GOKM_NETDEV_TXQ_MAX) {
 		DEV_STATS_INC(dev, tx_dropped);
@@ -66,6 +87,7 @@ static void gokm_netdev_tx_work(struct work_struct *work)
 		}
 		DEV_STATS_INC(p->dev, tx_packets);
 		DEV_STATS_ADD(p->dev, tx_bytes, skb->len);
+		atomic64_inc(&p->deferred);
 
 		GOKM_ENTER();
 		gokm_netdev_go_xmit(p->handle, skb->data, skb->len);
@@ -119,8 +141,8 @@ static void gokm_netdev_setup(struct net_device *dev)
 	dev->priv_flags |= IFF_NO_QUEUE;
 }
 
-long gokm_netdev_create(const char *name, long mtu, unsigned long handle,
-			unsigned long *out, char *out_name)
+long gokm_netdev_create(const char *name, long mtu, bool atomic_xmit,
+			unsigned long handle, unsigned long *out, char *out_name)
 {
 	struct gokm_netdev_priv *p;
 	struct net_device *dev;
@@ -133,6 +155,9 @@ long gokm_netdev_create(const char *name, long mtu, unsigned long handle,
 	p = netdev_priv(dev);
 	p->dev = dev;
 	p->handle = handle;
+	p->atomic_xmit = atomic_xmit;
+	atomic64_set(&p->direct, 0);
+	atomic64_set(&p->deferred, 0);
 	skb_queue_head_init(&p->txq);
 	INIT_WORK(&p->tx_work, gokm_netdev_tx_work);
 
@@ -186,4 +211,12 @@ long gokm_netdev_rx(unsigned long ptr, const void *pkt, long len)
 	DEV_STATS_ADD(dev, rx_bytes, len);
 	netif_rx(skb);
 	return 0;
+}
+
+void gokm_netdev_stats(unsigned long ptr, u64 *direct, u64 *deferred)
+{
+	struct gokm_netdev_priv *p = netdev_priv((struct net_device *)ptr);
+
+	*direct = atomic64_read(&p->direct);
+	*deferred = atomic64_read(&p->deferred);
 }

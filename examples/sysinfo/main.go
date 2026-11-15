@@ -13,11 +13,10 @@ import (
 	"gokm/procfs"
 )
 
-// Static inline functions and macros have no symbol to call: gokm generates
-// a C wrapper with the signature declared here.
-
-//gokm:inline utsname linux/utsname.h
-func utsname() *linux.NewUtsname
+// linux.Utsname (the static inline utsname()) needs no declaration: gokm
+// finds its signature in the kernel headers. Function-like macros like
+// num_online_cpus() have no signature to find, so they're declared here and
+// gokm generates the C wrapper.
 
 //gokm:inline num_online_cpus
 func numOnlineCPUs() uint32
@@ -38,14 +37,15 @@ func (info) Read() ([]byte, error) {
 	var si linux.Sysinfo // struct sysinfo, laid out exactly as in this kernel
 	linux.SiMeminfo(&si) // exported kernel function
 
-	u := utsname()
+	u := linux.Utsname()                      // static inline function
+	ts := linux.NsToTimespec64(1_500_000_000) // returns a struct by value
 	unit := uint64(si.MemUnit)
 	return []byte(fmt.Sprintf(
 		"release: %s\nmachine: %s\ncpus: %d\nram_total_mib: %d\nram_free_mib: %d\n"+
-			"uptime_s: %d\nhz: %d\npage_size: %d\n",
+			"uptime_s: %d\nhz: %d\npage_size: %d\ntimespec: %d.%09d\n",
 		cstring(u.Release[:]), cstring(u.Machine[:]), numOnlineCPUs(),
 		si.Totalram*unit>>20, si.Freeram*unit>>20,
-		linux.KtimeGetSeconds(), linux.HZ, linux.PAGE_SIZE)), nil
+		linux.KtimeGetSeconds(), linux.HZ, linux.PAGE_SIZE, ts.TvSec, ts.TvNsec)), nil
 }
 
 // Write parses a number of milliseconds with the kernel's own kstrtouint

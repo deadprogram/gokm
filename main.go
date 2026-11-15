@@ -68,7 +68,10 @@ func cmdBuild(args []string) error {
 	fs.StringVar(&o.KernelDir, "kdir", "", "kernel build `dir` (default: /lib/modules/<kver>/build)")
 	fs.StringVar(&o.Description, "description", "", "MODULE_DESCRIPTION `text`")
 	fs.StringVar(&o.Author, "author", "", "MODULE_AUTHOR `text`")
-	fs.StringVar(&o.HeapSize, "heap-size", build.DefaultHeapSize, "default `size` of the garbage-collected Go heap, e.g. 512K, 4M\n(can be overridden at load time: insmod mod.ko heap_size=8M)")
+	fs.StringVar(&o.License, "license", "GPL", "MODULE_LICENSE: one of "+strings.Join(build.Licenses, ", ")+"\n(GPL-compatible only: gokm's runtime uses GPL-only kernel symbols)")
+	fs.StringVar(&o.HeapSize, "heap-size", build.DefaultHeapSize, "initial `size` of the garbage-collected Go heap, e.g. 512K, 4M\n(can be overridden at load time: insmod mod.ko heap_size=8M)")
+	fs.StringVar(&o.HeapMax, "heap-max", build.DefaultHeapMax, "`size` limit the Go heap can grow to (load time: heap_max=...)")
+	fs.StringVar(&o.StackLimit, "stack-limit", "8K", "warn about Go call paths using more kernel stack than `size` (0 disables the analysis)")
 	fs.BoolVar(&o.Verbose, "v", false, "print the commands run and their output")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: gokm build [flags] [dir]")

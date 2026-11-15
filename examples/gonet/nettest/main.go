@@ -191,13 +191,46 @@ func main() {
 		close(errs)
 		return <-errs
 	}())
+	check("UDP flood: 20000 datagrams", func() error {
+		c, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(remote), Port: 7})
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		c.SetReadBuffer(8 << 20)
+		got := make(chan int)
+		go func() {
+			n := 0
+			buf := make([]byte, 2048)
+			for {
+				c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+				if _, err := c.Read(buf); err != nil {
+					break
+				}
+				n++
+			}
+			got <- n
+		}()
+		start := time.Now()
+		payload := []byte(strings.Repeat("f", 200))
+		for i := 0; i < 20000; i++ {
+			c.Write(payload)
+		}
+		n := <-got
+		fmt.Printf("nettest:      %d/20000 replies (sent in %v)\n", n, time.Since(start).Round(time.Millisecond))
+		if n < 10000 {
+			return fmt.Errorf("only %d replies", n)
+		}
+		return nil
+	}())
 	check("/proc/goecho counters", func() error {
 		b, err := os.ReadFile("/proc/goecho")
 		if err != nil {
 			return err
 		}
 		fmt.Printf("nettest:      %s\n", strings.ReplaceAll(strings.TrimSpace(string(b)), "\n", ", "))
-		if !strings.Contains(string(b), "pings: 3\n") || !strings.Contains(string(b), "udp: 802\n") {
+		if !strings.Contains(string(b), "pings: 3\n") || !strings.Contains(string(b), "udp: 20802\n") ||
+			strings.Contains(string(b), "transmit_direct: 0\n") {
 			return fmt.Errorf("unexpected counters")
 		}
 		return nil

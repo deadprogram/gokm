@@ -2,13 +2,18 @@ package kernel
 
 import "unsafe"
 
-// Memory in a gokm module comes in two kinds:
+// Memory in a gokm module:
 //
 //   - The Go heap: everything new/make/append/closures/maps allocate. It's
-//     garbage collected (conservative mark/sweep) and has a fixed size, set
-//     with `gokm build -heap-size` or at load time with
-//     `insmod mod.ko heap_size=8M`. Use runtime.GC() and runtime.ReadMemStats
-//     as usual.
+//     garbage collected and grows from heap_size up to heap_max (`gokm build
+//     -heap-size/-heap-max`, or `insmod mod.ko heap_size=... heap_max=...`),
+//     giving memory back when it shrinks. Use runtime.GC() and
+//     runtime.ReadMemStats as usual.
+//
+//   - kernel.MakeBytes(n) is make([]byte, n) that returns ENOMEM instead of
+//     failing fatally when the heap is full (running out of memory is a
+//     fatal error in Go, as for make/new/append): use it for large buffers
+//     whose size depends on the input.
 //
 //   - Off-heap buffers from AllocBytes: kernel memory (kvzalloc) outside the GC
 //     heap, freed explicitly with FreeBytes. Use them for large or long-lived
@@ -46,4 +51,24 @@ func FreeBytes(b []byte) {
 		return
 	}
 	gokmFree(unsafe.Pointer(unsafe.SliceData(b)))
+}
+
+//go:linkname tryAlloc runtime.kmodTryAlloc
+func tryAlloc(size uintptr) unsafe.Pointer
+
+// MakeBytes returns a zeroed, garbage-collected []byte of length n, or
+// ENOMEM if the Go heap can't hold it (after collecting garbage and growing
+// up to heap_max). Unlike make, it never fails fatally.
+func MakeBytes(n int) ([]byte, error) {
+	if n < 0 {
+		return nil, EINVAL
+	}
+	if n == 0 {
+		return []byte{}, nil
+	}
+	p := tryAlloc(uintptr(n))
+	if p == nil {
+		return nil, ENOMEM
+	}
+	return unsafe.Slice((*byte)(p), n), nil
 }

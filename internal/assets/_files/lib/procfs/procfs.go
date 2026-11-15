@@ -5,7 +5,8 @@
 //	}))
 //
 // Read is called once per open() and its result is what that open file
-// reads (so readers always see a consistent snapshot). If the handler also
+// reads (so readers always see a consistent snapshot). Handlers can run
+// concurrently on several CPUs: protect shared state. If the handler also
 // implements Writer, the file is writable and each write() is passed to it.
 // Files are removed automatically at module exit (or earlier with Remove).
 package procfs
@@ -38,7 +39,6 @@ type File struct {
 	handler Handler
 	ptr     uintptr
 	handle  kernel.Handle
-	pending []byte // content being copied by the C side
 }
 
 // Implemented in the procfs glue (gokm/frameworks/procfs/procfs.c).
@@ -83,7 +83,8 @@ func (f *File) Remove() {
 }
 
 // Called by the glue between GOKM_ENTER and GOKM_LEAVE. *buf points into Go
-// memory kept alive by File.pending until the next open.
+// memory, valid until GOKM_LEAVE (no collection runs while the task is in
+// Go).
 //
 //export gokm_procfs_go_open
 func goOpen(h uintptr, buf **byte, n *int) (rc int) {
@@ -93,7 +94,6 @@ func goOpen(h uintptr, buf **byte, n *int) (rc int) {
 	if err != nil {
 		return kernel.ToErrno(err)
 	}
-	f.pending = data
 	*n = len(data)
 	if len(data) > 0 {
 		*buf = &data[0]

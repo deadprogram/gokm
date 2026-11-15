@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
+	"unsafe"
 )
 
 var failed bool
@@ -93,6 +95,42 @@ func main() {
 		got, _ := os.ReadFile("/proc/gorev")
 		if !strings.HasPrefix(string(got), "opens: 0\nwrites: 0\n") {
 			return fmt.Errorf("after reset %q", got)
+		}
+		return nil
+	}())
+
+	check("ioctls: GOREV_LEN, GOREV_CLEAR, unknown, bad pointer", func() error {
+		const (
+			goRevClear = 'g'<<8 | 1
+			goRevLen   = 2<<30 | 4<<16 | 'g'<<8 | 2
+		)
+		os.WriteFile("/dev/gorev", []byte("abcdef"), 0)
+		f, err := os.Open("/dev/gorev")
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		ioctl := func(cmd, arg uintptr) error {
+			if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), cmd, arg); e != 0 {
+				return e
+			}
+			return nil
+		}
+		var n uint32
+		if err := ioctl(goRevLen, uintptr(unsafe.Pointer(&n))); err != nil || n != 7 {
+			return fmt.Errorf("GOREV_LEN = %d, %v", n, err)
+		}
+		if err := ioctl(goRevClear, 0); err != nil {
+			return err
+		}
+		if err := ioctl(goRevLen, uintptr(unsafe.Pointer(&n))); err != nil || n != 0 {
+			return fmt.Errorf("GOREV_LEN after clear = %d, %v", n, err)
+		}
+		if err := ioctl(0x1234, 0); err != syscall.ENOTTY {
+			return fmt.Errorf("unknown ioctl: %v", err)
+		}
+		if err := ioctl(goRevLen, 8); err != syscall.EFAULT {
+			return fmt.Errorf("bad pointer: %v", err)
 		}
 		return nil
 	}())

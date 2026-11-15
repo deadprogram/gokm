@@ -48,7 +48,61 @@ type (
 	Releaser interface {
 		Release()
 	}
+	// Ioctler handles ioctl(2). arg is the raw argument: when it's a user
+	// pointer, read/write through it with CopyFromUser/CopyToUser. The int
+	// result is what ioctl returns (non-negative).
+	Ioctler interface {
+		Ioctl(cmd uint32, arg uintptr) (int, error)
+	}
 )
+
+// Linux ioctl command encoding (_IO, _IOR, _IOW, _IOWR from
+// <asm-generic/ioctl.h>): typ is the "magic" byte, nr the command number,
+// size the size of the argument struct.
+func IO(typ byte, nr uint8) uint32 { return ioc(0, typ, nr, 0) }
+
+// IOR is a command that reads from the device into a user buffer.
+func IOR(typ byte, nr uint8, size uintptr) uint32 { return ioc(2, typ, nr, size) }
+
+// IOW is a command that writes a user buffer to the device.
+func IOW(typ byte, nr uint8, size uintptr) uint32 { return ioc(1, typ, nr, size) }
+
+// IOWR is a command that does both.
+func IOWR(typ byte, nr uint8, size uintptr) uint32 { return ioc(3, typ, nr, size) }
+
+func ioc(dir uint32, typ byte, nr uint8, size uintptr) uint32 {
+	return dir<<30 | uint32(size&0x3fff)<<16 | uint32(typ)<<8 | uint32(nr)
+}
+
+//export gokm_chardev_copy_from_user
+func cCopyFromUser(dst *byte, uaddr uintptr, n int) int
+
+//export gokm_chardev_copy_to_user
+func cCopyToUser(uaddr uintptr, src *byte, n int) int
+
+// CopyFromUser copies len(dst) bytes from the user-space address uaddr
+// (e.g. an ioctl argument). It returns EFAULT if the memory isn't readable.
+// Process context only (it may fault pages in).
+func CopyFromUser(dst []byte, uaddr uintptr) error {
+	if len(dst) == 0 {
+		return nil
+	}
+	if rc := cCopyFromUser(&dst[0], uaddr, len(dst)); rc != 0 {
+		return kernel.Errno(-rc)
+	}
+	return nil
+}
+
+// CopyToUser copies src to the user-space address uaddr.
+func CopyToUser(uaddr uintptr, src []byte) error {
+	if len(src) == 0 {
+		return nil
+	}
+	if rc := cCopyToUser(uaddr, &src[0], len(src)); rc != 0 {
+		return kernel.Errno(-rc)
+	}
+	return nil
+}
 
 // Device is a character device.
 type Device struct {
@@ -147,6 +201,20 @@ func goWrite(h uintptr, buf *byte, count int, off int64) (rc int64) {
 	}
 	n, err := w.Write(view(buf, count), off)
 	if err != nil && n == 0 {
+		return int64(kernel.ToErrno(err))
+	}
+	return int64(n)
+}
+
+//export gokm_chardev_go_ioctl
+func goIoctl(h uintptr, cmd uint32, arg uintptr) (rc int64) {
+	defer kernel.CatchPanic(&rc)
+	io, ok := file(h).(Ioctler)
+	if !ok {
+		return -int64(kernel.ENOTTY)
+	}
+	n, err := io.Ioctl(cmd, arg)
+	if err != nil {
 		return int64(kernel.ToErrno(err))
 	}
 	return int64(n)
