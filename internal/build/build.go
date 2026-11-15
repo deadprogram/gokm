@@ -1,0 +1,468 @@
+// Package build turns a Go kernel module project into a .ko file.
+//
+// Pipeline:
+//
+//	project *.go ──tinygo build (custom target, overlay TINYGOROOT)──▶ go.ll
+//	go.ll ──fixupIR──▶ go.fixed.ll ──tinygo clang (kernel codegen flags)──▶ go.raw.o
+//	go.raw.o ──objcopy (strip debug, localize symbols)──▶ kmod/go.o_shipped
+//	kmod/{shim.c, go.o_shipped} ──kbuild──▶ <name>.ko
+package build
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+
+	"gokm/internal/assets"
+)
+
+// Options configure a build.
+type Options struct {
+	Dir         string // project directory (contains go.mod)
+	Output      string // output .ko path; default <Dir>/<Name>.ko
+	Name        string // module name; default derived from the go.mod module path
+	KernelVer   string // kernel release to build for; default `uname -r`
+	KernelDir   string // kernel build dir; default /lib/modules/<KernelVer>/build
+	Description string // MODULE_DESCRIPTION; default "<module path> (gokm)"
+	Author      string // MODULE_AUTHOR; optional
+	HeapSize    string // default Go heap size (module parameter heap_size); default DefaultHeapSize
+	Verbose     bool   // print commands and their full output
+	Log         io.Writer
+}
+
+// Result describes a finished build.
+type Result struct {
+	Output    string
+	Name      string
+	KernelDir string
+	WorkDir   string
+}
+
+// DefaultHeapSize is the default size of a module's garbage-collected Go heap.
+const DefaultHeapSize = "1M"
+
+var heapSizeRe = regexp.MustCompile(`^[0-9]+[KMG]?$`)
+
+// kernel codegen flags for lowering TinyGo's IR. These mirror what kbuild uses
+// for C on x86-64 and aren't exposed through TinyGo's target JSON.
+var kernelCFlags = []string{
+	"--target=x86_64-unknown-linux-gnu", "-O2",
+	"-mcmodel=kernel", "-fno-pic", "-mno-red-zone",
+	"-fcf-protection=branch",
+	"-mretpoline-external-thunk", "-mfunction-return=thunk-extern",
+}
+
+// Build runs the full pipeline.
+func Build(opts Options) (*Result, error) {
+	if opts.Log == nil {
+		opts.Log = os.Stderr
+	}
+	b := &builder{opts: opts}
+	return b.run()
+}
+
+type builder struct {
+	opts Options
+}
+
+func (b *builder) step(format string, args ...any) {
+	fmt.Fprintf(b.opts.Log, "gokm: "+format+"\n", args...)
+}
+
+func (b *builder) run() (*Result, error) {
+	proj, err := filepath.Abs(b.opts.Dir)
+	if err != nil {
+		return nil, err
+	}
+	mod, err := ReadGoMod(filepath.Join(proj, "go.mod"))
+	if err != nil {
+		return nil, err
+	}
+	name := b.opts.Name
+	if name == "" {
+		name = ModuleNameFromPath(mod.Path)
+	}
+	if err := ValidateModuleName(name); err != nil {
+		return nil, err
+	}
+	if b.opts.HeapSize == "" {
+		b.opts.HeapSize = DefaultHeapSize
+	}
+	if !heapSizeRe.MatchString(b.opts.HeapSize) {
+		return nil, fmt.Errorf("invalid heap size %q: use bytes or a K/M/G suffix, e.g. 4M", b.opts.HeapSize)
+	}
+
+	kdir, err := KernelBuildDir(b.opts.KernelVer, b.opts.KernelDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, tool := range []string{"tinygo", "objcopy", "make"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			return nil, fmt.Errorf("%s not found in PATH", tool)
+		}
+	}
+
+	cache, err := CacheDir()
+	if err != nil {
+		return nil, err
+	}
+	tgRoot, tgVersion, err := tinygoInfo()
+	if err != nil {
+		return nil, err
+	}
+	root, err := assets.Prepare(cache, tgRoot, tgVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	work := filepath.Join(cache, "build", shortHash(proj))
+	kmod := filepath.Join(work, "kmod")
+	if err := os.MkdirAll(kmod, 0o755); err != nil {
+		return nil, err
+	}
+
+	// A workspace that makes "gokm/kernel" resolvable from the project.
+	goWork := filepath.Join(work, "go.work")
+	if err := os.WriteFile(goWork, []byte(GoWorkContent(mod.GoVersion, proj, root.Lib, false)), 0o644); err != nil {
+		return nil, err
+	}
+	RefreshProjectGoWork(proj, mod.GoVersion, root.Lib)
+
+	// 1. Go -> LLVM IR.
+	b.step("compiling Go code with TinyGo %s", shortTinyGoVersion(tgVersion))
+	ll := filepath.Join(work, "go.ll")
+	cmd := exec.Command("tinygo", "build", "-target="+root.Target, "-opt=2", "-o", ll, ".")
+	cmd.Dir = proj
+	cmd.Env = append(os.Environ(), "TINYGOROOT="+root.TinyGoRoot, "GOWORK="+goWork)
+	if err := b.exec(cmd); err != nil {
+		return nil, err
+	}
+
+	// 2. Patch the IR for the kernel ABI.
+	raw, err := os.ReadFile(ll)
+	if err != nil {
+		return nil, err
+	}
+	fixed := filepath.Join(work, "go.fixed.ll")
+	if err := os.WriteFile(fixed, fixupIR(raw), 0o644); err != nil {
+		return nil, err
+	}
+
+	// 3. IR -> object with kernel codegen flags.
+	rawObj := filepath.Join(work, "go.raw.o")
+	args := append([]string{"clang"}, kernelCFlags...)
+	args = append(args, "-c", "-x", "ir", fixed, "-o", rawObj)
+	if err := b.exec(exec.Command("tinygo", args...)); err != nil {
+		return nil, err
+	}
+
+	// 4. Strip debug info (pahole can't turn Go DWARF names like "[]byte"
+	// into valid BTF) and make everything local except the symbols shim.c
+	// references.
+	if err := b.exec(exec.Command("objcopy", "--strip-debug",
+		"--keep-global-symbol=tinygo_kmod_init",
+		"--keep-global-symbol=tinygo_kmod_exit",
+		"--keep-global-symbol=tinygo_scanstack",
+		rawObj, filepath.Join(kmod, "go.o_shipped"))); err != nil {
+		return nil, err
+	}
+
+	// 5. kbuild.
+	if err := b.writeKmod(root, kmod, name, mod.Path); err != nil {
+		return nil, err
+	}
+	b.step("building %s.ko against %s", name, kdir)
+	if err := b.exec(exec.Command("make", "-C", kdir, "M="+kmod, "modules")); err != nil {
+		return nil, err
+	}
+
+	out := b.opts.Output
+	if out == "" {
+		out = filepath.Join(proj, name+".ko")
+	}
+	if err := copyFile(filepath.Join(kmod, name+".ko"), out); err != nil {
+		return nil, err
+	}
+	return &Result{Output: out, Name: name, KernelDir: kdir, WorkDir: work}, nil
+}
+
+func (b *builder) writeKmod(root *assets.Root, kmod, name, modPath string) error {
+	// Drop outputs of a previous build that used a different module name.
+	if entries, err := os.ReadDir(kmod); err == nil {
+		for _, e := range entries {
+			if e.Name() != "go.o_shipped" {
+				os.RemoveAll(filepath.Join(kmod, e.Name()))
+			}
+		}
+	}
+	for _, f := range []string{"shim.c", "gokm.h"} {
+		if err := copyFile(filepath.Join(root.Kmod, f), filepath.Join(kmod, f)); err != nil {
+			return err
+		}
+	}
+
+	kbuild := fmt.Sprintf(`obj-m := %[1]s.o
+%[1]s-y := shim.o go.o
+
+# go.o is produced by TinyGo and handed to kbuild prebuilt as go.o_shipped.
+# if_changed records the .go.o.cmd file modpost expects for every object.
+quiet_cmd_shipped = SHIPPED $@
+      cmd_shipped = cat $< > $@
+
+$(obj)/go.o: $(src)/go.o_shipped FORCE
+	$(call if_changed,shipped)
+
+targets += go.o
+`, name)
+
+	desc := b.opts.Description
+	if desc == "" {
+		desc = modPath + " (Go kernel module built with gokm)"
+	}
+	var info strings.Builder
+	info.WriteString("/* Generated by gokm. */\n")
+	info.WriteString("MODULE_LICENSE(\"GPL\");\n")
+	fmt.Fprintf(&info, "MODULE_DESCRIPTION(%s);\n", cString(desc))
+	if b.opts.Author != "" {
+		fmt.Fprintf(&info, "MODULE_AUTHOR(%s);\n", cString(b.opts.Author))
+	}
+	fmt.Fprintf(&info, "#define GOKM_DEFAULT_HEAP_SIZE %s\n", cString(b.opts.HeapSize))
+
+	if err := os.WriteFile(filepath.Join(kmod, "Kbuild"), []byte(kbuild), 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(kmod, "modinfo.h"), []byte(info.String()), 0o644)
+}
+
+// exec runs cmd. Output is shown only in verbose mode or when it fails.
+func (b *builder) exec(cmd *exec.Cmd) error {
+	if b.opts.Verbose {
+		fmt.Fprintf(b.opts.Log, "+ %s\n", strings.Join(cmd.Args, " "))
+		cmd.Stdout = b.opts.Log
+		cmd.Stderr = b.opts.Log
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("%s failed: %w", filepath.Base(cmd.Path), err)
+		}
+		return nil
+	}
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	cmd.Env = withCLocale(cmd.Env)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s failed: %w\n%s", filepath.Base(cmd.Path), err, strings.TrimSpace(buf.String()))
+	}
+	return nil
+}
+
+func withCLocale(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	return append(env, "LC_ALL=C")
+}
+
+// GoMod is the subset of go.mod gokm cares about.
+type GoMod struct {
+	Path      string
+	GoVersion string
+}
+
+var (
+	moduleRe = regexp.MustCompile(`(?m)^module\s+"?([^\s"]+)"?`)
+	goVerRe  = regexp.MustCompile(`(?m)^go\s+(\S+)`)
+)
+
+// ReadGoMod parses the module path and go version from a go.mod file.
+func ReadGoMod(path string) (*GoMod, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%s not found (run `gokm init` first)", path)
+		}
+		return nil, err
+	}
+	m := moduleRe.FindSubmatch(data)
+	if m == nil {
+		return nil, fmt.Errorf("%s: no module directive", path)
+	}
+	gm := &GoMod{Path: string(m[1]), GoVersion: assets.LibGoVersion}
+	if v := goVerRe.FindSubmatch(data); v != nil {
+		gm.GoVersion = string(v[1])
+	}
+	return gm, nil
+}
+
+// ModuleNameFromPath derives a kernel module name from a Go module path:
+// last path element, with characters invalid in module names replaced by "_".
+func ModuleNameFromPath(p string) string {
+	base := p[strings.LastIndex(p, "/")+1:]
+	var sb strings.Builder
+	for _, r := range base {
+		if r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			sb.WriteRune(r)
+		} else {
+			sb.WriteByte('_')
+		}
+	}
+	return sb.String()
+}
+
+var validName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// ValidateModuleName checks name can be used as a kernel module name.
+func ValidateModuleName(name string) error {
+	if !validName.MatchString(name) || len(name) > 55 {
+		return fmt.Errorf("invalid module name %q: use letters, digits and _ (max 55 chars)", name)
+	}
+	if name == "shim" || name == "go" {
+		return fmt.Errorf("module name %q is reserved, pick another with -name", name)
+	}
+	return nil
+}
+
+// KernelBuildDir resolves the kernel build directory to compile against.
+func KernelBuildDir(kver, kdir string) (string, error) {
+	if kdir != "" {
+		if _, err := os.Stat(filepath.Join(kdir, "Makefile")); err != nil {
+			return "", fmt.Errorf("kernel build dir %s: no Makefile", kdir)
+		}
+		return kdir, nil
+	}
+	if kver == "" {
+		out, err := exec.Command("uname", "-r").Output()
+		if err != nil {
+			return "", fmt.Errorf("uname -r: %w", err)
+		}
+		kver = strings.TrimSpace(string(out))
+	}
+	dir := filepath.Join("/lib/modules", kver, "build")
+	if _, err := os.Stat(filepath.Join(dir, "Makefile")); err != nil {
+		msg := fmt.Sprintf("no kernel headers for %s (%s missing)", kver, dir)
+		if avail := installedKernels(); len(avail) > 0 {
+			msg += "\navailable: " + strings.Join(avail, ", ") + " (use -kver)"
+		} else {
+			msg += "\ninstall your distribution's kernel headers package (e.g. linux-headers)"
+		}
+		return "", errors.New(msg)
+	}
+	return dir, nil
+}
+
+func installedKernels() []string {
+	matches, _ := filepath.Glob("/lib/modules/*/build/Makefile")
+	var out []string
+	for _, m := range matches {
+		out = append(out, filepath.Base(filepath.Dir(filepath.Dir(m))))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// CacheDir is where gokm keeps extracted assets and build directories.
+func CacheDir() (string, error) {
+	if d := os.Getenv("GOKMCACHE"); d != "" {
+		return d, nil
+	}
+	d, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(d, "gokm"), nil
+}
+
+// PrepareAssets materializes the assets for the installed TinyGo.
+func PrepareAssets() (*assets.Root, error) {
+	cache, err := CacheDir()
+	if err != nil {
+		return nil, err
+	}
+	tgRoot, tgVersion, err := tinygoInfo()
+	if err != nil {
+		return nil, err
+	}
+	return assets.Prepare(cache, tgRoot, tgVersion)
+}
+
+func tinygoInfo() (root, version string, err error) {
+	if _, err := exec.LookPath("tinygo"); err != nil {
+		return "", "", errors.New("tinygo not found in PATH (https://tinygo.org/getting-started/install/)")
+	}
+	out, err := exec.Command("tinygo", "env", "TINYGOROOT").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("tinygo env TINYGOROOT: %w", err)
+	}
+	root = strings.TrimSpace(string(out))
+	if os.Getenv("TINYGOROOT") != "" {
+		// Don't stack our overlay on top of a user-provided overlay by accident.
+		root = os.Getenv("TINYGOROOT")
+	}
+	out, err = exec.Command("tinygo", "version").Output()
+	if err != nil {
+		return "", "", fmt.Errorf("tinygo version: %w", err)
+	}
+	return root, strings.TrimSpace(string(out)), nil
+}
+
+// gokmWorkMarker identifies go.work files written by gokm.
+const gokmWorkMarker = "// Generated by gokm"
+
+// GoWorkContent returns a go.work using the project and the gokm lib module.
+func GoWorkContent(goVersion, proj, lib string, forEditor bool) string {
+	var sb strings.Builder
+	sb.WriteString(gokmWorkMarker)
+	if forEditor {
+		sb.WriteString(" so editors can resolve \"gokm/kernel\". `gokm build`\n// rewrites it when needed; it's machine-specific, don't commit it.")
+	}
+	fmt.Fprintf(&sb, "\n\ngo %s\n\nuse (\n\t%s\n\t%s\n)\n", goVersion, proj, lib)
+	return sb.String()
+}
+
+// RefreshProjectGoWork updates the project's editor go.work if gokm created it
+// and it points to an outdated asset directory.
+func RefreshProjectGoWork(proj, goVersion, lib string) {
+	p := filepath.Join(proj, "go.work")
+	data, err := os.ReadFile(p)
+	if err != nil || !bytes.HasPrefix(data, []byte(gokmWorkMarker)) {
+		return
+	}
+	want := GoWorkContent(goVersion, ".", lib, true)
+	if string(data) != want {
+		os.WriteFile(p, []byte(want), 0o644)
+	}
+}
+
+// shortTinyGoVersion turns "tinygo version 0.43.0 linux/amd64 (...)" into "0.43.0".
+func shortTinyGoVersion(v string) string {
+	if f := strings.Fields(v); len(f) >= 3 && f[0] == "tinygo" {
+		return f[2]
+	}
+	return v
+}
+
+func cString(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+	return `"` + r.Replace(s) + `"`
+}
+
+func shortHash(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])[:16]
+}
+
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o644)
+}

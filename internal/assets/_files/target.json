@@ -1,0 +1,14 @@
+{
+  "llvm-target": "x86_64-unknown-linux-gnu",
+  "cpu": "x86-64",
+  "features": "-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-mmx,-x87,+soft-float,+retpoline-indirect-calls,+retpoline-indirect-branches,+retpoline-external-thunk",
+  "build-tags": ["linuxkernel", "baremetal", "linux", "amd64"],
+  "goos": "linux",
+  "goarch": "amd64",
+  "gc": "conservative",
+  "scheduler": "none",
+  "code-model": "kernel",
+  "relocation-model": "static",
+  "default-stack-size": 4096,
+  "automatic-stack-size": false
+}

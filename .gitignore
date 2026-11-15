@@ -1,0 +1,4 @@
+/gokm
+*.ko
+go.work
+go.work.sum
