@@ -5,8 +5,10 @@
 //
 //	target.json   TinyGo target for code running inside the Linux kernel
 //	overlay/      files added on top of TinyGo's source tree (runtime platform)
-//	lib/          the "gokm/kernel" Go package user code imports
+//	lib/          the "gokm" Go module: gokm/kernel, gokm/fs, gokm/netdev, ...
 //	kmod/         C shim compiled into every module by kbuild
+//	frameworks/   C glue for framework packages: frameworks/fs/ is compiled
+//	              in when the project imports gokm/fs
 //
 // The directory name starts with "_" so the go tool doesn't treat the Go files
 // in it (which only build with TinyGo for the kernel target) as packages of
@@ -41,6 +43,7 @@ type Root struct {
 	TinyGoRoot string // overlay TINYGOROOT
 	Lib        string // module dir providing gokm/kernel
 	Kmod       string // C shim sources
+	Frameworks string // C glue of framework packages: frameworks/<pkg>/*.c
 }
 
 // Prepare materializes the assets for the given system TinyGo root/version
@@ -57,6 +60,7 @@ func Prepare(cacheDir, sysTinyGoRoot, tinygoVersion string) (*Root, error) {
 		TinyGoRoot: filepath.Join(dir, "tinygoroot"),
 		Lib:        filepath.Join(dir, "lib"),
 		Kmod:       filepath.Join(dir, "kmod"),
+		Frameworks: filepath.Join(dir, "frameworks"),
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".complete")); err == nil {
 		return r, nil

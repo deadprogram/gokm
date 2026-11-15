@@ -4,6 +4,10 @@
 # "TEST: PASS" / "TEST: FAIL" at the end.
 #
 # Usage: test/qemu/run.sh path/to/module.ko [param=value ...]
+#
+#   TEST_PROG=dir               Go main package (built with the regular Go
+#                               toolchain) to run in the VM after loading
+#   EXPECT_LOAD_ERRNO=ENODEV    expect loading to fail with this errno
 #   KERNEL=/boot/vmlinuz-linux  kernel image to boot (must match the kernel
 #                               the module was built for)
 set -eu
@@ -15,10 +19,16 @@ KERNEL=${KERNEL:-/boot/vmlinuz-linux}
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-mkdir -p "$WORK/root/proc"
+mkdir -p "$WORK/root/proc" "$WORK/root/dev"
 (cd "$HERE" && CGO_ENABLED=0 go build -o "$WORK/root/init" ./init)
 cp "$KO" "$WORK/root/module.ko"
 echo "$*" >"$WORK/root/params"
+if [ -n "${TEST_PROG:-}" ]; then
+	(cd "$TEST_PROG" && CGO_ENABLED=0 GOWORK=off go build -o "$WORK/root/test" .)
+fi
+if [ -n "${EXPECT_LOAD_ERRNO:-}" ]; then
+	echo "$EXPECT_LOAD_ERRNO" >"$WORK/root/expect_errno"
+fi
 (cd "$WORK/root" && find . | cpio -o -H newc --quiet | gzip -1) >"$WORK/initramfs.cpio.gz"
 
 ACCEL="-machine accel=tcg"

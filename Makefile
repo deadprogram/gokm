@@ -2,12 +2,13 @@
 # `make`) and then `gokm init` / `gokm build`.
 #
 #   make                       build ./gokm
-#   make test                  unit tests
-#   make qemu [KVER=...]       build the examples and load/unload them in QEMU
-#                              (KERNEL= picks the kernel image, default
-#                              /boot/vmlinuz-linux; KVER must match it)
+#   make test                  vet + unit tests
+#   make qemu [KVER=...]       build the examples and test fixtures and run
+#                              each in its own QEMU VM (KERNEL= picks the kernel
+#                              image, default /boot/vmlinuz-linux; KVER must
+#                              match it)
 
-KVER   ?= $(shell file -bL $${KERNEL:-/boot/vmlinuz-linux} | sed -n 's/.*version \([^ ]*\).*/\1/p')
+KVER ?= $(shell file -bL $${KERNEL:-/boot/vmlinuz-linux} | sed -n 's/.*version \([^ ]*\).*/\1/p')
 
 .PHONY: all gokm test qemu clean
 all: gokm
@@ -19,16 +20,32 @@ test:
 	go vet ./...
 	go test ./...
 
+# qemu_test <name> <project dir> <build flags> <env for run.sh> <grep patterns...>:
+# build the module, boot it in QEMU (log in _qemu/<name>.log) and require
+# "TEST: PASS" plus every extra pattern in the log.
+define qemu_test
+	./gokm build -kver $(KVER) $(3) $(2)
+	$(4) sh test/qemu/run.sh $(2)/$(notdir $(2)).ko >_qemu/$(1).log 2>&1 || true
+	@for p in "TEST: PASS" $(5); do \
+		grep -q "$$p" _qemu/$(1).log || { echo "FAIL: $(1): missing '$$p' (see _qemu/$(1).log)"; exit 1; }; \
+	done
+	@echo "PASS: $(1)"
+endef
+
 qemu: gokm
-	./gokm build -kver $(KVER) examples/hello
-	sh test/qemu/run.sh examples/hello/hello.ko >hello.log 2>&1; cat hello.log
-	grep -q "TEST: PASS" hello.log
-	./gokm build -kver $(KVER) -heap-size 256K examples/gcstress
-	sh test/qemu/run.sh examples/gcstress/gcstress.ko >gcstress.log 2>&1; cat gcstress.log
-	grep -q "TEST: PASS" gcstress.log && grep -q "gcstress: OK" gcstress.log && \
-		grep -q "list still intact at exit" gcstress.log
-	@rm -f hello.log gcstress.log
-	@echo "all QEMU tests passed"
+	mkdir -p _qemu
+	$(call qemu_test,hello,examples/hello,,,"goodbye after")
+	$(call qemu_test,gcstress,examples/gcstress,-heap-size 256K,,"gcstress: OK" "list still intact at exit")
+	$(call qemu_test,gofs,examples/gofs,-heap-size 8M,TEST_PROG=examples/gofs/fstest,"fstest: ok   remount is a fresh")
+	$(call qemu_test,devices,examples/devices,,TEST_PROG=examples/devices/devtest,"devtest: ok   /proc/gorev reset")
+	$(call qemu_test,gonet,examples/gonet,,TEST_PROG=examples/gonet/nettest,"nettest: ok   /proc/goecho counters")
+	$(call qemu_test,sysinfo,examples/sysinfo,,TEST_PROG=examples/sysinfo/infotest,"infotest: PASS")
+	$(call qemu_test,failload,test/fixtures/failload,,EXPECT_LOAD_ERRNO=ENODEV,)
+	$(call qemu_test,nested,test/fixtures/nested,-heap-size 256K,,"nested: OK")
+	$(call qemu_test,parked,test/fixtures/parked,-heap-size 256K,TEST_PROG=test/fixtures/parked/parkedtest,"parkedtest: PASS")
+	@! grep -l "exit hook ran" _qemu/failload.log
+	@! grep -lE "BUG:|Oops|WARNING:|Call Trace" _qemu/*.log
+	@echo "all QEMU tests passed (logs in _qemu/)"
 
 clean:
-	rm -f gokm examples/*/*.ko
+	rm -rf gokm examples/*/*.ko test/fixtures/*/*.ko _qemu

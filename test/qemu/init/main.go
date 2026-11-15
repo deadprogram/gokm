@@ -1,12 +1,16 @@
 // Command init is the /init of the QEMU test initramfs (built with the regular
 // Go toolchain, statically). It loads /module.ko, shows it in /proc/modules,
-// unloads it and powers the VM off. Kernel log output goes to the serial
-// console.
+// runs /test if present, unloads the module and powers the VM off. Kernel log
+// output goes to the serial console.
+//
+// If /expect_errno exists, loading is instead expected to fail with that
+// errno name (e.g. ENODEV).
 package main
 
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +35,9 @@ func run() bool {
 	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
 		fmt.Println("mount /proc:", err)
 	}
+	if err := syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, ""); err != nil {
+		fmt.Println("mount /dev:", err)
+	}
 
 	f, err := os.Open("/module.ko")
 	if err != nil {
@@ -44,6 +51,11 @@ func run() bool {
 	_, _, errno := syscall.Syscall(sysFinitModule, f.Fd(),
 		uintptr(unsafe.Pointer(&params[0])), 0)
 	f.Close()
+	if want, err := os.ReadFile("/expect_errno"); err == nil {
+		got := errnoName(errno)
+		fmt.Printf("init: finit_module returned %s, expected %s\n", got, strings.TrimSpace(string(want)))
+		return got == strings.TrimSpace(string(want))
+	}
 	if errno != 0 {
 		fmt.Println("finit_module:", errno)
 		return false
@@ -60,6 +72,16 @@ func run() bool {
 	}
 	modName := fields[0]
 
+	if _, err := os.Stat("/test"); err == nil {
+		fmt.Println("init: running /test")
+		cmd := exec.Command("/test")
+		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Println("init: /test failed:", err)
+			return false
+		}
+	}
+
 	time.Sleep(200 * time.Millisecond)
 
 	name := []byte(modName + "\x00")
@@ -71,4 +93,16 @@ func run() bool {
 		return false
 	}
 	return true
+}
+
+func errnoName(e syscall.Errno) string {
+	names := map[syscall.Errno]string{
+		0: "OK", syscall.ENODEV: "ENODEV", syscall.ENOMEM: "ENOMEM",
+		syscall.EINVAL: "EINVAL", syscall.EBUSY: "EBUSY", syscall.EIO: "EIO",
+		syscall.EEXIST: "EEXIST", syscall.ENOENT: "ENOENT", syscall.EPERM: "EPERM",
+	}
+	if n, ok := names[e]; ok {
+		return n
+	}
+	return fmt.Sprint(int(e))
 }

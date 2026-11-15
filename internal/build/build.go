@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"gokm/internal/assets"
+	"gokm/internal/bindgen"
 )
 
 // Options configure a build.
@@ -105,7 +106,7 @@ func (b *builder) run() (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, tool := range []string{"tinygo", "objcopy", "make"} {
+	for _, tool := range []string{"tinygo", "objcopy", "ld", "make"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			return nil, fmt.Errorf("%s not found in PATH", tool)
 		}
@@ -130,20 +131,52 @@ func (b *builder) run() (*Result, error) {
 		return nil, err
 	}
 
-	// A workspace that makes "gokm/kernel" resolvable from the project.
-	goWork := filepath.Join(work, "go.work")
-	if err := os.WriteFile(goWork, []byte(GoWorkContent(mod.GoVersion, proj, root.Lib, false)), 0o644); err != nil {
+	exports, err := readKernelExports(kdir)
+	if err != nil {
+		return nil, fmt.Errorf("reading kernel exports: %w", err)
+	}
+
+	// The project is built from a copy, with gokm pragmas rewritten.
+	src := filepath.Join(work, "src")
+	scan, err := prepareSource(proj, src)
+	if err != nil {
 		return nil, err
 	}
-	RefreshProjectGoWork(proj, mod.GoVersion, root.Lib)
+	genRoot := filepath.Join(work, "gen")
+	if err := os.RemoveAll(genRoot); err != nil {
+		return nil, err
+	}
+	var gen *bindgen.Output
+	var extraModules []string
+	if len(scan.names) > 0 || len(scan.pragmas) > 0 {
+		b.step("generating %s bindings (%d names, %d pragmas)", LinuxPkg, len(scan.names), len(scan.pragmas))
+		genDir := filepath.Join(genRoot, "linux")
+		if gen, err = b.generateBindings(scan, kdir, work, genDir, exports); err != nil {
+			return nil, err
+		}
+		extraModules = append(extraModules, genDir)
+	}
+
+	// A workspace that makes gokm's packages (and gokm/linux) resolvable.
+	goWork := filepath.Join(work, "go.work")
+	if err := os.WriteFile(goWork, []byte(GoWorkContent(mod.GoVersion, src, root.Lib, false, extraModules...)), 0o644); err != nil {
+		return nil, err
+	}
+	RefreshProjectGoWork(proj, mod.GoVersion, root.Lib, extraModules...)
 
 	// 1. Go -> LLVM IR.
 	b.step("compiling Go code with TinyGo %s", shortTinyGoVersion(tgVersion))
 	ll := filepath.Join(work, "go.ll")
+	tgEnv := append(os.Environ(), "TINYGOROOT="+root.TinyGoRoot, "GOWORK="+goWork)
 	cmd := exec.Command("tinygo", "build", "-target="+root.Target, "-opt=2", "-o", ll, ".")
-	cmd.Dir = proj
-	cmd.Env = append(os.Environ(), "TINYGOROOT="+root.TinyGoRoot, "GOWORK="+goWork)
+	cmd.Dir = src
+	cmd.Env = tgEnv
 	if err := b.exec(cmd); err != nil {
+		// Report positions in the project, not in the copy.
+		return nil, errors.New(strings.ReplaceAll(err.Error(), src+string(filepath.Separator), proj+string(filepath.Separator)))
+	}
+	frameworks, err := b.frameworks(root, src, tgEnv)
+	if err != nil {
 		return nil, err
 	}
 
@@ -165,19 +198,46 @@ func (b *builder) run() (*Result, error) {
 		return nil, err
 	}
 
-	// 4. Strip debug info (pahole can't turn Go DWARF names like "[]byte"
-	// into valid BTF) and make everything local except the symbols shim.c
-	// references.
-	if err := b.exec(exec.Command("objcopy", "--strip-debug",
-		"--keep-global-symbol=tinygo_kmod_init",
-		"--keep-global-symbol=tinygo_kmod_exit",
-		"--keep-global-symbol=tinygo_scanstack",
-		rawObj, filepath.Join(kmod, "go.o_shipped"))); err != nil {
+	// 4. Link in the compiler-rt builtins the Go code needs (soft-float,
+	// 128-bit arithmetic): the kernel doesn't provide them.
+	rt, err := b.prepareRTLib(root, cache, tgVersion)
+	if err != nil {
+		return nil, err
+	}
+	kernelExports := make(map[string]bool, len(exports))
+	for sym := range exports {
+		kernelExports[sym] = true
+	}
+	goSyms, err := readSymbols(rawObj)
+	if err != nil {
+		return nil, err
+	}
+	rtObjs, rtDefined := rt.resolve(goSyms.Undefined, kernelExports)
+	linkedObj := rawObj
+	if len(rtObjs) > 0 {
+		linkedObj = filepath.Join(work, "go.linked.o")
+		args := append([]string{"-r", "-o", linkedObj, rawObj}, rtObjs...)
+		if err := b.exec(exec.Command("ld", args...)); err != nil {
+			return nil, err
+		}
+	}
+
+	// 5. Strip debug info (pahole can't turn Go DWARF names like "[]byte"
+	// into valid BTF) and make Go internals, TinyGo's libc/atomic helpers and
+	// the builtins local. What stays global: the runtime entry points shim.c
+	// calls and //export functions, which C glue may call.
+	localize := filepath.Join(work, "localize.txt")
+	syms := append(append([]string{}, localizedSymbols...), rtDefined...)
+	if err := os.WriteFile(localize, []byte(strings.Join(syms, "\n")+"\n"), 0o644); err != nil {
+		return nil, err
+	}
+	if err := b.exec(exec.Command("objcopy", "--strip-debug", "--wildcard",
+		"--localize-symbols="+localize, linkedObj, filepath.Join(kmod, "go.o_shipped"))); err != nil {
 		return nil, err
 	}
 
-	// 5. kbuild.
-	if err := b.writeKmod(root, kmod, name, mod.Path); err != nil {
+	// 6. kbuild.
+	if err := b.writeKmod(root, proj, kmod, name, mod.Path, frameworks, gen, genRoot); err != nil {
 		return nil, err
 	}
 	b.step("building %s.ko against %s", name, kdir)
@@ -195,7 +255,80 @@ func (b *builder) run() (*Result, error) {
 	return &Result{Output: out, Name: name, KernelDir: kdir, WorkDir: work}, nil
 }
 
-func (b *builder) writeKmod(root *assets.Root, kmod, name, modPath string) error {
+// CSrcDir is the project subdirectory whose .c/.h files are compiled into the
+// module (it can't be the Go package directory: Go rejects .c files there
+// without cgo).
+const CSrcDir = "csrc"
+
+// localizedSymbols are objcopy wildcard patterns for global symbols in the Go
+// object that must not be visible to the rest of the module.
+var localizedSymbols = []string{
+	"*.*", // Go-internal symbols: runtime.alloc, main.main, ...
+	"__atomic_*", "__sync_*", "__errno_location",
+	"malloc", "calloc", "realloc", "free",
+	"fmaximum*", "fminimum*", "runtime_putchar",
+}
+
+// copyCSources copies the .c/.h files of srcDir (if it exists) into
+// kmod/sub and returns the kbuild objects for the .c files.
+func copyCSources(srcDir, kmod, sub string) ([]string, error) {
+	entries, err := os.ReadDir(srcDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(kmod, sub), 0o755); err != nil {
+		return nil, err
+	}
+	var objs []string
+	for _, e := range entries {
+		n := e.Name()
+		ext := filepath.Ext(n)
+		if e.IsDir() || (ext != ".c" && ext != ".h") {
+			continue
+		}
+		if err := copyFile(filepath.Join(srcDir, n), filepath.Join(kmod, sub, n)); err != nil {
+			return nil, err
+		}
+		if ext == ".c" {
+			objs = append(objs, sub+"/"+strings.TrimSuffix(n, ".c")+".o")
+		}
+	}
+	return objs, nil
+}
+
+// frameworks returns the gokm framework packages (those with C glue) that
+// the project imports, directly or not.
+func (b *builder) frameworks(root *assets.Root, dir string, env []string) ([]string, error) {
+	cmd := exec.Command("tinygo", "list", "-target="+root.Target, "-deps", ".")
+	cmd.Dir = dir
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		var stderr []byte
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = ee.Stderr
+		}
+		return nil, fmt.Errorf("listing dependencies: %w\n%s", err, strings.TrimSpace(string(stderr)))
+	}
+	var fws []string
+	for _, line := range strings.Split(string(out), "\n") {
+		pkg, ok := strings.CutPrefix(strings.TrimSpace(line), assets.LibModule+"/")
+		if !ok {
+			continue
+		}
+		if st, err := os.Stat(filepath.Join(root.Frameworks, pkg)); err == nil && st.IsDir() {
+			fws = append(fws, pkg)
+		}
+	}
+	sort.Strings(fws)
+	return fws, nil
+}
+
+func (b *builder) writeKmod(root *assets.Root, proj, kmod, name, modPath string, frameworks []string,
+	gen *bindgen.Output, genRoot string) error {
 	// Drop outputs of a previous build that used a different module name.
 	if entries, err := os.ReadDir(kmod); err == nil {
 		for _, e := range entries {
@@ -210,8 +343,47 @@ func (b *builder) writeKmod(root *assets.Root, kmod, name, modPath string) error
 		}
 	}
 
+	// C sources: framework glue for imported gokm packages, then the
+	// project's own csrc/.
+	var userObjs []string
+	for _, fw := range frameworks {
+		objs, err := copyCSources(filepath.Join(root.Frameworks, fw), kmod, "gokm_"+fw)
+		if err != nil {
+			return err
+		}
+		userObjs = append(userObjs, objs...)
+	}
+	if len(frameworks) > 0 {
+		b.step("using frameworks: gokm/%s", strings.Join(frameworks, ", gokm/"))
+	}
+	if gen != nil && len(gen.C) > 0 {
+		cdir := filepath.Join(genRoot, "c")
+		if err := os.MkdirAll(cdir, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(cdir, "wrappers.c"), gen.C, 0o644); err != nil {
+			return err
+		}
+		objs, err := copyCSources(cdir, kmod, "gokm_gen")
+		if err != nil {
+			return err
+		}
+		userObjs = append(userObjs, objs...)
+	}
+	objs, err := copyCSources(filepath.Join(proj, CSrcDir), kmod, CSrcDir)
+	if err != nil {
+		return err
+	}
+	if len(objs) > 0 {
+		b.step("adding C sources: %s", strings.Join(objs, " "))
+	}
+	userObjs = append(userObjs, objs...)
+
 	kbuild := fmt.Sprintf(`obj-m := %[1]s.o
-%[1]s-y := shim.o go.o
+%[1]s-y := shim.o go.o %[2]s
+
+# Project C files (csrc/) can #include "gokm.h".
+ccflags-y += -I$(src)
 
 # go.o is produced by TinyGo and handed to kbuild prebuilt as go.o_shipped.
 # if_changed records the .go.o.cmd file modpost expects for every object.
@@ -222,7 +394,7 @@ $(obj)/go.o: $(src)/go.o_shipped FORCE
 	$(call if_changed,shipped)
 
 targets += go.o
-`, name)
+`, name, strings.Join(userObjs, " "))
 
 	desc := b.opts.Description
 	if desc == "" {
@@ -236,6 +408,11 @@ targets += go.o
 		fmt.Fprintf(&info, "MODULE_AUTHOR(%s);\n", cString(b.opts.Author))
 	}
 	fmt.Fprintf(&info, "#define GOKM_DEFAULT_HEAP_SIZE %s\n", cString(b.opts.HeapSize))
+	if gen != nil {
+		for _, ns := range gen.Namespaces {
+			fmt.Fprintf(&info, "MODULE_IMPORT_NS(%s);\n", cString(ns))
+		}
+	}
 
 	if err := os.WriteFile(filepath.Join(kmod, "Kbuild"), []byte(kbuild), 0o644); err != nil {
 		return err
@@ -417,25 +594,29 @@ func tinygoInfo() (root, version string, err error) {
 const gokmWorkMarker = "// Generated by gokm"
 
 // GoWorkContent returns a go.work using the project and the gokm lib module.
-func GoWorkContent(goVersion, proj, lib string, forEditor bool) string {
+func GoWorkContent(goVersion, proj, lib string, forEditor bool, extra ...string) string {
 	var sb strings.Builder
 	sb.WriteString(gokmWorkMarker)
 	if forEditor {
 		sb.WriteString(" so editors can resolve \"gokm/kernel\". `gokm build`\n// rewrites it when needed; it's machine-specific, don't commit it.")
 	}
-	fmt.Fprintf(&sb, "\n\ngo %s\n\nuse (\n\t%s\n\t%s\n)\n", goVersion, proj, lib)
+	fmt.Fprintf(&sb, "\n\ngo %s\n\nuse (\n\t%s\n\t%s\n", goVersion, proj, lib)
+	for _, e := range extra {
+		fmt.Fprintf(&sb, "\t%s\n", e)
+	}
+	sb.WriteString(")\n")
 	return sb.String()
 }
 
 // RefreshProjectGoWork updates the project's editor go.work if gokm created it
 // and it points to an outdated asset directory.
-func RefreshProjectGoWork(proj, goVersion, lib string) {
+func RefreshProjectGoWork(proj, goVersion, lib string, extra ...string) {
 	p := filepath.Join(proj, "go.work")
 	data, err := os.ReadFile(p)
 	if err != nil || !bytes.HasPrefix(data, []byte(gokmWorkMarker)) {
 		return
 	}
-	want := GoWorkContent(goVersion, ".", lib, true)
+	want := GoWorkContent(goVersion, ".", lib, true, extra...)
 	if string(data) != want {
 		os.WriteFile(p, []byte(want), 0o644)
 	}

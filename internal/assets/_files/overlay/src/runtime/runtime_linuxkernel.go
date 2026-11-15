@@ -10,10 +10,12 @@
 // The heap is a single vzalloc() region the shim allocates at module load
 // (size: module parameter heap_size) and frees at unload. The GC scans:
 //   - globals: compiler-generated root tables (gc_globals_blocks.go)
-//   - the stack: from the current SP up to stackTop, which the shim sets to
-//     its own frame address each time it calls into Go, so every Go frame
+//   - the stack: from the current SP up to stackTop, the frame address of
+//     the C function that first entered Go on this task, so every Go frame
 //     lies below it
 //   - callee-saved registers: spilled by tinygo_scanCurrentStack (shim.c)
+//   - parked tasks (blocked in a kernel call made for Go, Go lock released):
+//     their stacks and spilled registers, via tinygo_kmod_markrange
 
 package runtime
 
@@ -105,55 +107,73 @@ var stackTop uintptr
 // collection doesn't free enough, allocation fails with "out of memory".
 func growHeap() bool { return false }
 
-// enterDepth counts nested calls from C into Go. Only the outermost entry
-// sets stackTop, so it stays above every Go frame on the stack.
-var enterDepth int
+// Hooks for shim.c's Go lock (see gokm_enter/gokm_park there). Several
+// tasks can have Go frames on their stacks, but only the one holding the Go
+// lock runs Go code; the shim sets stackTop to that task's stack top each time
+// a task takes the lock.
 
-func enter(top uintptr) {
-	if enterDepth == 0 {
-		stackTop = top
-	}
-	enterDepth++
+//export tinygo_kmod_set_stack_top
+func kmodSetStackTop(top uintptr) {
+	stackTop = top
 }
 
-func leave() {
-	enterDepth--
+//export tinygo_kmod_flush
+func kmodFlush() {
 	if lineLen > 0 {
 		flushLine()
 	}
 }
 
-// Entry points called from shim.c. Each takes the caller's frame address as
-// the GC's stack top.
+// tinygo_kmod_markrange lets the shim mark roots outside the running stack:
+// the stacks and saved registers of parked tasks.
+//
+//export tinygo_kmod_markrange
+func kmodMarkRange(start, end uintptr) {
+	if start < end {
+		markRoots(start, end)
+	}
+}
 
-var kmodExitHook func()
+// Entry points called from shim.c, between gokm_enter and gokm_leave.
+
+var kmodExitHooks []func()
+
+// kmodInitErr is the (positive) errno module init fails with, set through
+// kernel.FailLoad.
+var kmodInitErr int
 
 // tinygo_kmod_init sets up the GC heap, runs package initializers and then
-// main.main, which acts as the module's init function.
+// main.main, which acts as the module's init function. It returns 0 or a
+// negative errno for insmod.
 //
 //export tinygo_kmod_init
-func tinygo_kmod_init(top, heap, heapSize uintptr) {
-	enter(top)
+func tinygo_kmod_init(heap, heapSize uintptr) int {
 	heapStart = heap
 	heapEnd = heap + heapSize
 	initRand()
 	initHeap()
 	initAll()
 	callMain()
-	leave()
+	return -kmodInitErr
 }
 
 //export tinygo_kmod_exit
-func tinygo_kmod_exit(top uintptr) {
-	enter(top)
-	if kmodExitHook != nil {
-		kmodExitHook()
+func tinygo_kmod_exit() {
+	// Last registered runs first (like defer).
+	for i := len(kmodExitHooks) - 1; i >= 0; i-- {
+		kmodExitHooks[i]()
 	}
-	leave()
+	kmodExitHooks = nil
 }
 
-// SetModuleExit registers fn to run when the module is unloaded. It's exposed
+// kmodAddExit registers fn to run when the module is unloaded. It's exposed
 // to the kernel package via go:linkname.
-func kmodSetExit(fn func()) {
-	kmodExitHook = fn
+func kmodAddExit(fn func()) {
+	kmodExitHooks = append(kmodExitHooks, fn)
+}
+
+// kmodSetInitError makes module init fail with the given positive errno once
+// main returns. Exposed to the kernel package via go:linkname.
+func kmodSetInitError(errno int) {
+	kmodInitErr = errno
 }

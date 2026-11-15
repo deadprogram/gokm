@@ -1,0 +1,623 @@
+// Package bindgen generates the gokm/linux Go package for a target kernel:
+// declarations for the kernel functions, types and constants a project
+// references (as linux.X), with exact layouts taken from the kernel's BTF.
+//
+// Naming: C names become CamelCase Go names with leading underscores dropped
+// (si_meminfo -> SiMeminfo, struct super_block -> SuperBlock, field i_mode ->
+// IMode). Constants (enum values and macros) keep their C name (HZ,
+// GFP_KERNEL, I_NEW).
+//
+// Mapping:
+//   - exported kernel functions (in Module.symvers and BTF): body-less Go
+//     functions with //export, i.e. direct calls with the C ABI;
+//   - structs/unions/typedef'd structs: Go structs with every field at its
+//     BTF offset (explicit padding, size checked at compile time). Fields
+//     Go can't express (bitfields, nested structs not referenced themselves,
+//     unions) become byte arrays of the right size;
+//   - pointers to referenced types are typed (*Inode), other pointers are
+//     unsafe.Pointer, function pointers uintptr;
+//   - enum constants from BTF; any other name is looked up as a macro and
+//     evaluated by compiling it against the kernel headers (see Probe).
+package bindgen
+
+import (
+	"bytes"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/token"
+	"sort"
+	"strings"
+	"unicode"
+
+	"gokm/internal/btf"
+)
+
+// Gen resolves names against a kernel's BTF and exports.
+type Gen struct {
+	spec    *btf.Spec
+	exports map[string]string // exported symbol -> namespace
+
+	funcs map[string]*btf.Type // Go name -> FUNC (exported only)
+	types map[string]*btf.Type // Go name -> STRUCT/UNION/TYPEDEF
+	enums map[string]int64     // C name -> value
+
+	// Set while generating.
+	typeName   map[uint32]string // type ID -> Go name, for referenced types
+	usedNS     map[string]bool
+	needUnsafe bool
+}
+
+// New indexes a kernel's BTF and exported symbols.
+func New(spec *btf.Spec, exports map[string]string) *Gen {
+	g := &Gen{
+		spec: spec, exports: exports,
+		funcs: map[string]*btf.Type{}, types: map[string]*btf.Type{}, enums: map[string]int64{},
+	}
+	better := func(old *btf.Type, new *btf.Type) bool {
+		return old == nil || leadingUnderscores(new.Name) < leadingUnderscores(old.Name)
+	}
+	for _, t := range spec.Types {
+		switch t.Kind {
+		case btf.KindFunc:
+			if _, ok := exports[t.Name]; ok {
+				n := GoName(t.Name)
+				if better(g.funcs[n], t) {
+					g.funcs[n] = t
+				}
+			}
+		case btf.KindStruct, btf.KindUnion:
+			if t.Name != "" && len(t.Members) > 0 {
+				n := GoName(t.Name)
+				if old := g.types[n]; old == nil || old.Kind == btf.KindTypedef || better(old, t) {
+					g.types[n] = t
+				}
+			}
+		case btf.KindTypedef:
+			if t.Name != "" {
+				n := GoName(t.Name)
+				if g.types[n] == nil {
+					g.types[n] = t
+				}
+			}
+		case btf.KindEnum, btf.KindEnum64:
+			for _, e := range t.Enums {
+				g.enums[e.Name] = e.Value
+			}
+		}
+	}
+	return g
+}
+
+func leadingUnderscores(s string) int { return len(s) - len(strings.TrimLeft(s, "_")) }
+
+// GoName converts a C identifier to an exported CamelCase Go name.
+func GoName(c string) string {
+	var b strings.Builder
+	for _, part := range strings.Split(c, "_") {
+		if part == "" {
+			continue
+		}
+		r := []rune(part)
+		r[0] = unicode.ToUpper(r[0])
+		b.WriteString(string(r))
+	}
+	s := b.String()
+	if s == "" || !unicode.IsLetter([]rune(s)[0]) {
+		s = "X" + s
+	}
+	return s
+}
+
+// Macros returns the referenced names that are neither exported functions,
+// types nor enum constants: candidates to evaluate as macro constants.
+func (g *Gen) Macros(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if g.funcs[n] == nil && g.types[n] == nil {
+			if _, ok := g.enums[n]; !ok {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// Const is a macro constant's value.
+type Const struct {
+	Value  int64
+	Signed bool
+}
+
+// Output is the generated code.
+type Output struct {
+	Go         []byte   // package linux
+	C          []byte   // wrappers for //gokm:inline and //gokm:blocking
+	Namespaces []string // symbol namespaces to import (MODULE_IMPORT_NS)
+}
+
+// Pragma is a //gokm:inline or //gokm:blocking declaration in user code.
+type Pragma struct {
+	Kind   string // "inline" or "blocking"
+	CName  string // the C function or macro to call
+	Decl   *ast.FuncDecl
+	Linux  string // local name of the gokm/linux import in that file ("" if none)
+	Pos    token.Position
+	Symbol string // the C wrapper symbol the Go declaration now exports
+}
+
+// DefaultHeaders are included by the generated C wrappers and macro probes;
+// //gokm:include and the header arguments of pragmas add more.
+var DefaultHeaders = []string{
+	"linux/module.h", "linux/kernel.h", "linux/types.h", "linux/errno.h", "linux/stat.h",
+	"linux/gfp.h", "linux/slab.h", "linux/mm.h", "linux/sched.h", "linux/jiffies.h",
+	"linux/delay.h", "linux/fs.h", "linux/uaccess.h", "linux/utsname.h", "linux/cpumask.h",
+}
+
+// Includes renders #include lines for the default and extra headers.
+func Includes(extra []string) string {
+	seen := map[string]bool{}
+	var b strings.Builder
+	for _, h := range append(append([]string{}, DefaultHeaders...), extra...) {
+		if !seen[h] {
+			seen[h] = true
+			fmt.Fprintf(&b, "#include <%s>\n", h)
+		}
+	}
+	return b.String()
+}
+
+// Generate produces the gokm/linux package for the referenced names (with
+// macro values from the probe), and C wrappers for the pragmas.
+func (g *Gen) Generate(names []string, macros map[string]Const, pragmas []Pragma, headers []string) (*Output, error) {
+	g.typeName = map[uint32]string{}
+	g.usedNS = map[string]bool{}
+	g.needUnsafe = false
+	var errs []string
+
+	// Types first: functions and fields refer to them by name.
+	var typeNames []string
+	for _, n := range names {
+		if t := g.types[n]; t != nil && g.funcs[n] == nil {
+			g.typeName[t.ID] = n
+			if t.Kind == btf.KindTypedef {
+				// Pointers to the underlying struct also get the name.
+				if u := g.spec.Skip(t.Ref); u.Kind == btf.KindStruct || u.Kind == btf.KindUnion {
+					if _, ok := g.typeName[u.ID]; !ok {
+						g.typeName[u.ID] = n
+					}
+				}
+			}
+			typeNames = append(typeNames, n)
+		}
+	}
+
+	var body bytes.Buffer
+	sort.Strings(typeNames)
+	for _, n := range typeNames {
+		body.WriteString(g.genType(n, g.types[n]))
+	}
+
+	var fnNames, constNames []string
+	for _, n := range names {
+		switch {
+		case g.funcs[n] != nil:
+			fnNames = append(fnNames, n)
+		case g.types[n] != nil:
+		default:
+			constNames = append(constNames, n)
+		}
+	}
+	sort.Strings(fnNames)
+	for _, n := range fnNames {
+		src, err := g.genFunc(n, g.funcs[n])
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		body.WriteString(src)
+	}
+
+	sort.Strings(constNames)
+	if len(constNames) > 0 {
+		body.WriteString("const (\n")
+		for _, n := range constNames {
+			if v, ok := g.enums[n]; ok {
+				fmt.Fprintf(&body, "\t%s = %d // enum constant\n", n, v)
+			} else if c, ok := macros[n]; ok {
+				if c.Signed || c.Value >= 0 {
+					fmt.Fprintf(&body, "\t%s = %d // macro\n", n, c.Value)
+				} else {
+					fmt.Fprintf(&body, "\t%s = %d // macro (unsigned)\n", n, uint64(c.Value))
+				}
+			} else {
+				errs = append(errs, fmt.Sprintf("linux.%s: no exported kernel function, type, enum constant or "+
+					"integer macro named %s (for inline functions and function-like macros, declare them with //gokm:inline)", n, n))
+			}
+		}
+		body.WriteString(")\n\n")
+	}
+
+	var c bytes.Buffer
+	for _, p := range pragmas {
+		src, err := g.genWrapper(p)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", p.Pos, err))
+			continue
+		}
+		c.WriteString(src)
+	}
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("%s", strings.Join(errs, "\n"))
+	}
+
+	var out bytes.Buffer
+	out.WriteString("// Code generated by gokm from the kernel's BTF. DO NOT EDIT.\n\n")
+	out.WriteString("// Package linux has the kernel functions, types and constants this module\n// references, for the kernel it was built against.\npackage linux\n\n")
+	if g.needUnsafe || len(typeNames) > 0 {
+		out.WriteString("import \"unsafe\"\n\nvar _ unsafe.Pointer\n\n")
+	}
+	out.Write(body.Bytes())
+
+	formatted, err := format.Source(out.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("formatting generated bindings: %w", err)
+	}
+	o := &Output{Go: formatted}
+	if c.Len() > 0 {
+		o.C = append([]byte("// Generated by gokm: wrappers for //gokm:inline and //gokm:blocking.\n"+
+			Includes(headers)+"#include \"gokm.h\"\n\n"), c.Bytes()...)
+	}
+	for ns := range g.usedNS {
+		o.Namespaces = append(o.Namespaces, ns)
+	}
+	sort.Strings(o.Namespaces)
+	return o, nil
+}
+
+// goType maps a BTF type to a Go type expression. ok is false for types Go
+// code can't use by value (unreferenced structs, variadic, ...).
+func (g *Gen) goType(id uint32) (string, bool) {
+	t := g.spec.SkipQualifiers(id)
+	if n, ok := g.typeName[t.ID]; ok {
+		return n, true
+	}
+	switch t.Kind {
+	case btf.KindVoid:
+		return "", true
+	case btf.KindTypedef:
+		return g.goType(t.Ref)
+	case btf.KindInt:
+		if t.IntEncoding&btf.IntBool != 0 {
+			return "bool", true
+		}
+		signed := t.IntEncoding&btf.IntSigned != 0
+		if t.Size == 1 && t.IntEncoding&btf.IntChar != 0 {
+			return "byte", true // C char: byte, so char* is *byte and char[] is []byte
+		}
+		switch t.Size {
+		case 1:
+			if signed {
+				return "int8", true
+			}
+			return "byte", true
+		case 2, 4, 8:
+			bits := fmt.Sprint(t.Size * 8)
+			if signed {
+				return "int" + bits, true
+			}
+			return "uint" + bits, true
+		}
+		return "", false // __int128
+	case btf.KindEnum, btf.KindEnum64:
+		bits := fmt.Sprint(t.Size * 8)
+		if t.KindFlag {
+			return "int" + bits, true
+		}
+		return "uint" + bits, true
+	case btf.KindFloat:
+		switch t.Size {
+		case 4:
+			return "float32", true
+		case 8:
+			return "float64", true
+		}
+		return "", false
+	case btf.KindPtr:
+		target := g.spec.SkipQualifiers(t.Ref)
+		if n, ok := g.typeName[target.ID]; ok {
+			return "*" + n, true
+		}
+		u := g.spec.Skip(t.Ref)
+		if n, ok := g.typeName[u.ID]; ok {
+			return "*" + n, true
+		}
+		switch u.Kind {
+		case btf.KindFuncProto:
+			return "uintptr", true
+		case btf.KindInt, btf.KindEnum, btf.KindEnum64, btf.KindFloat:
+			if s, ok := g.goType(u.ID); ok {
+				return "*" + s, true
+			}
+		}
+		g.needUnsafe = true
+		return "unsafe.Pointer", true
+	case btf.KindArray:
+		if s, ok := g.goType(t.ArrayElem); ok && s != "" {
+			return fmt.Sprintf("[%d]%s", t.ArrayLen, s), true
+		}
+		return fmt.Sprintf("[%d]byte", g.spec.SizeOf(t.ID)), true
+	}
+	return "", false
+}
+
+// alignOf is a type's C alignment.
+func (g *Gen) alignOf(id uint32) uint32 {
+	t := g.spec.Skip(id)
+	switch t.Kind {
+	case btf.KindInt, btf.KindEnum, btf.KindEnum64, btf.KindFloat:
+		return min(max(t.Size, 1), 8)
+	case btf.KindPtr:
+		return 8
+	case btf.KindArray:
+		return g.alignOf(t.ArrayElem)
+	case btf.KindStruct, btf.KindUnion:
+		a := uint32(1)
+		for _, m := range t.Members {
+			a = max(a, g.alignOf(m.Type))
+		}
+		return a
+	}
+	return 1
+}
+
+type field struct {
+	name  string
+	off   uint32 // bytes
+	typ   uint32
+	cpath string
+}
+
+// flatten lists a struct's members, descending into anonymous members (C
+// lets code access their fields directly). Bitfields are skipped.
+func (g *Gen) flatten(t *btf.Type, base uint32, prefix string, out *[]field) {
+	for _, m := range t.Members {
+		if m.BitfieldSize != 0 || m.BitOffset%8 != 0 {
+			continue
+		}
+		off := base + m.BitOffset/8
+		if m.Name == "" {
+			if u := g.spec.Skip(m.Type); u.Kind == btf.KindStruct || u.Kind == btf.KindUnion {
+				g.flatten(u, off, prefix, out)
+			}
+			continue
+		}
+		*out = append(*out, field{name: m.Name, off: off, typ: m.Type, cpath: prefix + m.Name})
+	}
+}
+
+func (g *Gen) genType(name string, t *btf.Type) string {
+	var b strings.Builder
+	cname := t.Name
+	under := t
+	if t.Kind == btf.KindTypedef {
+		under = g.spec.Skip(t.Ref)
+		if under.Kind != btf.KindStruct && under.Kind != btf.KindUnion {
+			// A scalar typedef: an alias of its Go type.
+			if s, ok := g.goType(t.Ref); ok && s != "" {
+				return fmt.Sprintf("// %s is C's %s.\ntype %s = %s\n\n", name, cname, name, s)
+			}
+			return ""
+		}
+	} else {
+		kind := "struct"
+		if t.Kind == btf.KindUnion {
+			kind = "union"
+		}
+		cname = kind + " " + t.Name
+	}
+	size := under.Size
+	fmt.Fprintf(&b, "// %s is C's %s (%d bytes).\ntype %s struct {\n", name, cname, size, name)
+	switch align := g.alignOf(under.ID); {
+	case align >= 8:
+		b.WriteString("\t_ [0]uint64 // C alignment\n")
+	case align >= 4:
+		b.WriteString("\t_ [0]uint32 // C alignment\n")
+	}
+
+	var fields []field
+	if under.Kind == btf.KindStruct {
+		g.flatten(under, 0, "", &fields)
+	}
+	sort.SliceStable(fields, func(i, j int) bool { return fields[i].off < fields[j].off })
+
+	used := map[string]int{}
+	cur := uint32(0)
+	pad := 0
+	for _, f := range fields {
+		if f.off < cur {
+			continue // overlaps (union member after the first)
+		}
+		fsize := g.spec.SizeOf(f.typ)
+		if fsize == 0 {
+			continue // flexible array
+		}
+		gt, ok := g.goType(f.typ)
+		if !ok || gt == "" || f.off%g.alignOf(f.typ) != 0 {
+			gt = fmt.Sprintf("[%d]byte", fsize)
+		}
+		if f.off > cur {
+			fmt.Fprintf(&b, "\t_%d [%d]byte\n", pad, f.off-cur)
+			pad++
+		}
+		fname := GoName(f.name)
+		if n := used[fname]; n > 0 {
+			fname = fmt.Sprintf("%s_%d", fname, n)
+		}
+		used[fname]++
+		fmt.Fprintf(&b, "\t%s %s // %s, offset %d\n", fname, gt, f.cpath, f.off)
+		cur = f.off + fsize
+	}
+	if cur < size {
+		fmt.Fprintf(&b, "\t_%d [%d]byte\n", pad, size-cur)
+	}
+	b.WriteString("}\n\n")
+	// Compile-time layout check.
+	fmt.Fprintf(&b, "var _ [%d - unsafe.Sizeof(%s{})]byte\nvar _ [unsafe.Sizeof(%s{}) - %d]byte\n\n", size, name, name, size)
+	return b.String()
+}
+
+var goKeywords = map[string]bool{
+	"break": true, "case": true, "chan": true, "const": true, "continue": true, "default": true,
+	"defer": true, "else": true, "fallthrough": true, "for": true, "func": true, "go": true,
+	"goto": true, "if": true, "import": true, "interface": true, "map": true, "package": true,
+	"range": true, "return": true, "select": true, "struct": true, "switch": true, "type": true,
+	"var": true, "len": true, "cap": true, "new": true, "make": true, "string": true, "error": true,
+}
+
+func (g *Gen) genFunc(name string, fn *btf.Type) (string, error) {
+	proto := g.spec.Type(fn.Ref)
+	if proto == nil || proto.Kind != btf.KindFuncProto {
+		return "", fmt.Errorf("linux.%s: no prototype for %s", name, fn.Name)
+	}
+	var params []string
+	for i, p := range proto.Params {
+		if p.Type == 0 {
+			return "", fmt.Errorf("linux.%s: %s is variadic, which Go can't call; wrap it in C with //gokm:inline", name, fn.Name)
+		}
+		gt, ok := g.goType(p.Type)
+		if !ok || gt == "" {
+			return "", fmt.Errorf("linux.%s: parameter %d of %s is passed by value as a struct; reference the type too (linux.%s) or use //gokm:inline",
+				name, i, fn.Name, GoName(g.spec.Skip(p.Type).Name))
+		}
+		pn := p.Name
+		if pn == "" || goKeywords[pn] || pn == "unsafe" {
+			pn = fmt.Sprintf("p%d", i)
+		}
+		params = append(params, pn+" "+gt)
+	}
+	ret, ok := g.goType(proto.Ref)
+	if !ok {
+		return "", fmt.Errorf("linux.%s: %s returns a struct by value; use //gokm:inline", name, fn.Name)
+	}
+	if u := g.spec.Skip(proto.Ref); u.Kind == btf.KindStruct || u.Kind == btf.KindUnion {
+		return "", fmt.Errorf("linux.%s: %s returns a struct by value, which isn't supported", name, fn.Name)
+	}
+	if ns := g.exports[fn.Name]; ns != "" {
+		g.usedNS[ns] = true
+	}
+	return fmt.Sprintf("// %s calls the kernel function %s.\n//\n//export %s\nfunc %s(%s) %s\n\n",
+		name, fn.Name, fn.Name, name, strings.Join(params, ", "), ret), nil
+}
+
+// genWrapper writes the C function a //gokm:inline or //gokm:blocking Go
+// declaration calls: it forwards to the named C function or macro (with the
+// Go lock released around it, for blocking).
+func (g *Gen) genWrapper(p Pragma) (string, error) {
+	ft := p.Decl.Type
+	var params, args []string
+	if ft.Params != nil {
+		i := 0
+		for _, f := range ft.Params.List {
+			ct, err := g.cType(f.Type, p.Linux)
+			if err != nil {
+				return "", err
+			}
+			n := len(f.Names)
+			if n == 0 {
+				n = 1
+			}
+			for j := 0; j < n; j++ {
+				params = append(params, fmt.Sprintf("%s a%d", ct, i))
+				args = append(args, fmt.Sprintf("a%d", i))
+				i++
+			}
+		}
+	}
+	ret := "void"
+	if ft.Results != nil && len(ft.Results.List) > 0 {
+		if len(ft.Results.List) > 1 || len(ft.Results.List[0].Names) > 1 {
+			return "", fmt.Errorf("%s: only one result is supported", p.Decl.Name.Name)
+		}
+		ct, err := g.cType(ft.Results.List[0].Type, p.Linux)
+		if err != nil {
+			return "", err
+		}
+		ret = ct
+	}
+	if len(params) == 0 {
+		params = []string{"void"}
+	}
+	call := fmt.Sprintf("%s(%s)", p.CName, strings.Join(args, ", "))
+	var body string
+	switch {
+	case p.Kind == "blocking" && ret == "void":
+		body = fmt.Sprintf("\tGOKM_PARK();\n\t%s;\n\tGOKM_UNPARK();\n", call)
+	case p.Kind == "blocking":
+		body = fmt.Sprintf("\t%s r;\n\n\tGOKM_PARK();\n\tr = (%s)%s;\n\tGOKM_UNPARK();\n\treturn r;\n", ret, ret, call)
+	case ret == "void":
+		body = fmt.Sprintf("\t%s;\n", call)
+	default:
+		body = fmt.Sprintf("\treturn (%s)%s;\n", ret, call)
+	}
+	return fmt.Sprintf("/* %s: %s */\n%s %s(%s);\n%s %s(%s)\n{\n%s}\n\n",
+		p.Pos, p.Decl.Name.Name, ret, p.Symbol, strings.Join(params, ", "),
+		ret, p.Symbol, strings.Join(params, ", "), body), nil
+}
+
+// cType maps a Go parameter type in a pragma declaration to C.
+func (g *Gen) cType(e ast.Expr, linuxName string) (string, error) {
+	switch t := e.(type) {
+	case *ast.Ident:
+		switch t.Name {
+		case "int", "int64":
+			return "long", nil
+		case "uint", "uint64", "uintptr":
+			return "unsigned long", nil
+		case "int32", "rune":
+			return "int", nil
+		case "uint32":
+			return "unsigned int", nil
+		case "int16":
+			return "short", nil
+		case "uint16":
+			return "unsigned short", nil
+		case "int8":
+			return "signed char", nil
+		case "uint8", "byte":
+			return "unsigned char", nil
+		case "bool":
+			return "bool", nil
+		case "float32", "float64":
+			return "", fmt.Errorf("float parameters aren't supported in //gokm: wrappers (kernel C can't use floating point)")
+		}
+	case *ast.StarExpr:
+		if sel, ok := t.X.(*ast.SelectorExpr); ok {
+			if x, ok := sel.X.(*ast.Ident); ok && x.Name == linuxName {
+				if ty := g.types[sel.Sel.Name]; ty != nil {
+					switch ty.Kind {
+					case btf.KindStruct:
+						return "struct " + ty.Name + " *", nil
+					case btf.KindUnion:
+						return "union " + ty.Name + " *", nil
+					case btf.KindTypedef:
+						return ty.Name + " *", nil
+					}
+				}
+			}
+		}
+		return "void *", nil
+	case *ast.SelectorExpr:
+		if x, ok := t.X.(*ast.Ident); ok && x.Name == "unsafe" && t.Sel.Name == "Pointer" {
+			return "void *", nil
+		}
+		if x, ok := t.X.(*ast.Ident); ok && x.Name == linuxName {
+			if ty := g.types[t.Sel.Name]; ty != nil && ty.Kind == btf.KindTypedef {
+				if u := g.spec.Skip(ty.Ref); u.Kind != btf.KindStruct && u.Kind != btf.KindUnion {
+					return ty.Name, nil
+				}
+			}
+		}
+	}
+	return "", fmt.Errorf("unsupported type in //gokm: declaration (use integers, bool, pointers or unsafe.Pointer)")
+}

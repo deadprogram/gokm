@@ -25,10 +25,14 @@ func MonotonicNanos() int64 {
 	return gokmKtimeNs()
 }
 
-//go:linkname setExit runtime.kmodSetExit
-func setExit(fn func())
+//go:linkname addExit runtime.kmodAddExit
+func addExit(fn func())
 
 // OnExit registers fn to be called when the module is unloaded (rmmod).
+// Several functions can be registered; they run in reverse order (like
+// defer). Framework packages (gokm/fs, gokm/netdev, ...) use this to
+// unregister what's still registered, so a hook registered after
+// fs.Register runs before the filesystem is unregistered.
 func OnExit(fn func()) {
-	setExit(fn)
+	addExit(fn)
 }
