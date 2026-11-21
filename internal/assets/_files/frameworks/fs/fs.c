@@ -28,6 +28,7 @@
 #include <linux/string.h>
 #include <linux/buffer_head.h>
 #include <linux/blkdev.h>
+#include <linux/version.h>
 #include <linux/math64.h>
 #include <linux/statfs.h>
 #include <linux/writeback.h>
@@ -223,8 +224,14 @@ static int gokm_fs_new_node(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
+/* ->create lost its excl argument in Linux 7.3 (torvalds/linux b2f1e6301efa). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
 static int gokm_fs_create(struct mnt_idmap *idmap, struct inode *dir,
 			  struct dentry *dentry, umode_t mode)
+#else
+static int gokm_fs_create(struct mnt_idmap *idmap, struct inode *dir,
+			  struct dentry *dentry, umode_t mode, bool excl)
+#endif
 {
 	return gokm_fs_new_node(idmap, dir, dentry, (mode & ~S_IFMT) | S_IFREG);
 }
