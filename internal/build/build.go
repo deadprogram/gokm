@@ -196,7 +196,7 @@ func (b *builder) run() (*Result, error) {
 	b.step("compiling Go code with TinyGo %s", shortTinyGoVersion(tgVersion))
 	ll := filepath.Join(work, "go.ll")
 	tgEnv := append(os.Environ(), "TINYGOROOT="+root.TinyGoRoot, "GOWORK="+goWork)
-	cmd := exec.Command("tinygo", "build", "-target="+root.Target, "-opt=2", "-o", ll, ".")
+	cmd := exec.Command("tinygo", "build", "-target="+root.Target, "-opt=2", "-no-debug", "-o", ll, ".")
 	cmd.Dir = src
 	cmd.Env = tgEnv
 	if err := b.exec(cmd); err != nil {
