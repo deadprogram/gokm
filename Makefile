@@ -7,10 +7,13 @@
 #                              each in its own QEMU VM (KERNEL= picks the kernel
 #                              image, default /boot/vmlinuz-linux; KVER must
 #                              match it)
+#   make site                  build the website (site/) into site/public/
+#   make site-serve            preview the website at http://localhost:1313/gokm/
 
+HUGO ?= hugo
 KVER ?= $(shell file -bL $${KERNEL:-/boot/vmlinuz-linux} | sed -n 's/.*version \([^ ]*\).*/\1/p')
 
-.PHONY: all gokm test qemu clean
+.PHONY: all gokm test qemu site site-api site-serve clean
 all: gokm
 
 gokm:
@@ -49,5 +52,15 @@ qemu: gokm
 	@! grep -lE "BUG:|Oops|WARNING:|Call Trace" _qemu/*.log
 	@echo "all QEMU tests passed (logs in _qemu/)"
 
+# The API reference pages are generated from the packages' doc comments.
+site-api:
+	cd site/apidoc && go run . -src ../../internal/assets/_files/lib -import gokm -out ../content/api
+
+site: site-api
+	$(HUGO) --source site --minify --gc
+
+site-serve: site-api
+	$(HUGO) server --source site
+
 clean:
-	rm -rf gokm examples/*/*.ko test/fixtures/*/*.ko _qemu
+	rm -rf gokm examples/*/*.ko test/fixtures/*/*.ko _qemu site/public site/resources site/content/api

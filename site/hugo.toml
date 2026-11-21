@@ -1,0 +1,45 @@
+baseURL = "https://jespino.github.io/gokm/"
+title = "gokm"
+locale = "en"
+theme = "gopherdocs"
+disableKinds = ["taxonomy", "term", "rss"]
+enableRobotsTXT = true
+
+[params]
+  tagline = "Linux kernel modules in Go"
+  description = "Build Linux kernel modules from plain Go code, using TinyGo: filesystems, devices, /proc files and network interfaces written against Go packages."
+  repo = "https://github.com/jespino/gokm"
+  contentPath = "site/content"
+  badge = "experimental"
+  mascot = "img/gopher-tux.png"
+  mascotAlt = "The Go gopher in a Tux costume"
+  accent = "#a85d00"
+  accentDark = "#f2b84b"
+  sidebar = ["/docs", "/api"]
+  footer = "The mascot is based on the Go gopher by [Renée French](https://reneefrench.blogspot.com/) ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)), dressed as Tux, the Linux penguin by Larry Ewing."
+
+[[menus.main]]
+  name = "Docs"
+  pageRef = "/docs"
+  weight = 1
+[[menus.main]]
+  name = "Tutorial"
+  pageRef = "/docs/tutorial"
+  weight = 2
+[[menus.main]]
+  name = "API"
+  pageRef = "/api"
+  weight = 3
+
+[markup.highlight]
+  noClasses = false
+[markup.tableOfContents]
+  startLevel = 2
+  endLevel = 3
+
+[[module.mounts]]
+  source = "static"
+  target = "static"
+[[module.mounts]]
+  source = "../assets"
+  target = "static/img"

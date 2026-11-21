@@ -3,3 +3,9 @@
 go.work
 go.work.sum
 _qemu/
+
+# website build output and generated API reference
+/site/public/
+/site/resources/
+/site/content/api/
+/site/.hugo_build.lock

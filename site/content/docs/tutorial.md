@@ -1,8 +1,12 @@
-# Tutorial: a "hello world" Linux kernel module in Go
+---
+title: "Tutorial"
+description: "Build, load and unload a \"hello world\" Linux kernel module written in Go, then add a /proc file and a module parameter."
+weight: 2
+---
 
 This tutorial builds a tiny kernel module with gokm, loads it, and then
 extends it with a `/proc` file and a module parameter. It takes about ten
-minutes. [README.md](README.md) is the full reference.
+minutes. The rest of the [documentation](/docs/) is the full reference.
 
 > [!CAUTION]
 > A kernel module runs with full privileges inside the kernel: a bug can
@@ -183,17 +187,15 @@ sudo rmmod hello
 
 ## 8. Where to go next
 
-The [README](README.md) covers the rest:
+- [Packages](/docs/packages/): filesystems ([gokm/fs](/docs/packages/fs/)),
+  character devices and `/proc` files
+  ([gokm/chardev and gokm/procfs](/docs/packages/chardev-procfs/)),
+  network interfaces ([gokm/netdev](/docs/packages/netdev/)) and block
+  devices ([gokm/blk](/docs/packages/blk/)).
+- [gokm/linux](/docs/packages/linux/): call any kernel function directly.
+- [Memory](/docs/memory/) and [Concurrency](/docs/concurrency/): how the Go
+  heap and goroutines work inside the kernel.
+- [Limitations](/docs/limitations/): what doesn't work yet.
 
-- [Packages](README.md#packages): filesystems (`gokm/fs`), character
-  devices (`gokm/chardev`), network interfaces (`gokm/netdev`) and block
-  devices (`gokm/blk`).
-- [gokm/linux](README.md#gokmlinux-bindings-generated-from-the-kernels-btf):
-  call any kernel function directly.
-- [Memory](README.md#memory) and [Concurrency](README.md#concurrency):
-  how the Go heap and goroutines work inside the kernel.
-- [Limitations](README.md#limitations): what doesn't work yet.
-
-The `examples/` directory has complete modules to learn from: `gofs` (a
-filesystem), `devices` (a character device and a `/proc` file), `gonet` (a
-network interface) and `gobrd` (a RAM disk).
+The [examples](/docs/examples/) are complete modules to learn from: a
+filesystem, character devices, network interfaces and a RAM disk.
