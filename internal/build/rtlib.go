@@ -52,7 +52,7 @@ func (b *builder) prepareRTLib(root *assets.Root, cacheDir, tinygoVersion string
 	}
 
 	b.step("compiling compiler-rt builtins for the kernel (once per TinyGo install)")
-	src := filepath.Join(root.TinyGoRoot, "lib", "compiler-rt-builtins")
+	src, include := rtSourceDirs(root.TinyGoRoot)
 	files, err := filepath.Glob(filepath.Join(src, "*.c"))
 	if err != nil || len(files) == 0 {
 		return nil, fmt.Errorf("compiler-rt builtins not found in %s", src)
@@ -60,7 +60,6 @@ func (b *builder) prepareRTLib(root *assets.Root, cacheDir, tinygoVersion string
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	include := filepath.Join(root.TinyGoRoot, "lib", "clang", "include")
 
 	lib.Objects = map[string]*rtObject{}
 	var mu sync.Mutex
@@ -102,6 +101,22 @@ func (b *builder) prepareRTLib(root *assets.Root, cacheDir, tinygoVersion string
 	}
 	lib.index()
 	return lib, nil
+}
+
+// rtSourceDirs returns the compiler-rt builtins sources and clang headers of
+// a TinyGo release, or of a TinyGo source checkout built with `make`.
+func rtSourceDirs(tinygoRoot string) (src, include string) {
+	src = filepath.Join(tinygoRoot, "lib", "compiler-rt-builtins")
+	include = filepath.Join(tinygoRoot, "lib", "clang", "include")
+	if _, err := os.Stat(src); err != nil {
+		src = filepath.Join(tinygoRoot, "llvm-project", "compiler-rt", "lib", "builtins")
+	}
+	if _, err := os.Stat(include); err != nil {
+		if dirs, _ := filepath.Glob(filepath.Join(tinygoRoot, "llvm-build", "lib", "clang", "*", "include")); len(dirs) > 0 {
+			include = dirs[len(dirs)-1]
+		}
+	}
+	return src, include
 }
 
 func (l *rtLib) index() {
