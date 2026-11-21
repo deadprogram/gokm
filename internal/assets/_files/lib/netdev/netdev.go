@@ -182,7 +182,8 @@ func goXmit(h uintptr, pkt *byte, n int) {
 
 //export gokm_netdev_go_open
 func goOpen(h uintptr) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	if o, ok := iface(h).Driver.(Opener); ok {
 		return kernel.ToErrno(o.Open())
 	}
@@ -191,7 +192,8 @@ func goOpen(h uintptr) (rc int) {
 
 //export gokm_netdev_go_stop
 func goStop(h uintptr) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	if s, ok := iface(h).Driver.(Stopper); ok {
 		return kernel.ToErrno(s.Stop())
 	}

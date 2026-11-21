@@ -14,6 +14,16 @@ import "runtime"
 // On panic it logs the panic value and sets *rc to -EIO (rc may be nil for
 // functions without a result). Framework packages already do this around
 // every callback into user code.
+//
+// Taking &rc makes TinyGo allocate rc on the heap at every call. On hot
+// paths, set the result first and pass nil, as a recovered panic returns
+// the current value of rc:
+//
+//	func handler() (rc int) {
+//		rc = -int(kernel.EIO)
+//		defer kernel.CatchPanic[int](nil)
+//		...
+//	}
 func CatchPanic[T ~int | ~int32 | ~int64](rc *T) {
 	r := recover()
 	if r == nil {
