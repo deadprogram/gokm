@@ -28,6 +28,7 @@
 #include <linux/string.h>
 #include <linux/buffer_head.h>
 #include <linux/blkdev.h>
+#include <linux/version.h>
 #include <linux/math64.h>
 #include <linux/statfs.h>
 #include <linux/writeback.h>
@@ -201,7 +202,14 @@ static struct dentry *gokm_fs_lookup(struct inode *dir, struct dentry *dentry,
 	return d_splice_alias(inode, dentry);
 }
 
-static int gokm_fs_new_node(struct mnt_idmap *idmap, struct inode *dir,
+/* Linux 7.4 passes the idmap as const (torvalds/linux 00b04f4495c3). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+typedef const struct mnt_idmap gokm_idmap_t;
+#else
+typedef struct mnt_idmap gokm_idmap_t;
+#endif
+
+static int gokm_fs_new_node(gokm_idmap_t *idmap, struct inode *dir,
 			    struct dentry *dentry, umode_t mode)
 {
 	struct inode *inode;
@@ -223,13 +231,19 @@ static int gokm_fs_new_node(struct mnt_idmap *idmap, struct inode *dir,
 	return 0;
 }
 
-static int gokm_fs_create(struct mnt_idmap *idmap, struct inode *dir,
+/* ->create lost its excl argument in Linux 7.3 (torvalds/linux b2f1e6301efa). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
+static int gokm_fs_create(gokm_idmap_t *idmap, struct inode *dir,
 			  struct dentry *dentry, umode_t mode)
+#else
+static int gokm_fs_create(gokm_idmap_t *idmap, struct inode *dir,
+			  struct dentry *dentry, umode_t mode, bool excl)
+#endif
 {
 	return gokm_fs_new_node(idmap, dir, dentry, (mode & ~S_IFMT) | S_IFREG);
 }
 
-static struct dentry *gokm_fs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+static struct dentry *gokm_fs_mkdir(gokm_idmap_t *idmap, struct inode *dir,
 				    struct dentry *dentry, umode_t mode)
 {
 	int err = gokm_fs_new_node(idmap, dir, dentry, (mode & ~S_IFMT) | S_IFDIR);
@@ -266,7 +280,7 @@ static int gokm_fs_rmdir(struct inode *dir, struct dentry *dentry)
 	return gokm_fs_remove(dir, dentry, true);
 }
 
-static int gokm_fs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+static int gokm_fs_rename(gokm_idmap_t *idmap, struct inode *old_dir,
 			  struct dentry *old_dentry, struct inode *new_dir,
 			  struct dentry *new_dentry, unsigned int flags)
 {
@@ -295,7 +309,7 @@ static int gokm_fs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	return 0;
 }
 
-static int gokm_fs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+static int gokm_fs_symlink(gokm_idmap_t *idmap, struct inode *dir,
 			   struct dentry *dentry, const char *target)
 {
 	struct inode *inode;
@@ -461,7 +475,7 @@ out:
 	return ret;
 }
 
-static int gokm_fs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int gokm_fs_setattr(gokm_idmap_t *idmap, struct dentry *dentry,
 			   struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -600,7 +614,7 @@ static int gokm_fs_xattr_get(const struct xattr_handler *h, struct dentry *dentr
 	return n;
 }
 
-static int gokm_fs_xattr_set(const struct xattr_handler *h, struct mnt_idmap *idmap,
+static int gokm_fs_xattr_set(const struct xattr_handler *h, gokm_idmap_t *idmap,
 			     struct dentry *dentry, struct inode *inode, const char *name,
 			     const void *value, size_t size, int flags)
 {
