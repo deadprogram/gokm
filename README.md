@@ -1,10 +1,19 @@
 # gokm — Go Kernel Modules
 
+> [!WARNING]
+> gokm is **experimental**. Don't use it in production: the modules it
+> builds run inside the kernel, where a bug in the generated code or the Go
+> runtime can crash the machine or corrupt data, and the API may change
+> without notice.
+
 `gokm` builds Linux kernel modules (x86-64) from plain Go code, using TinyGo.
 A project is just Go files: filesystems, character devices, `/proc` files and
 network devices are written against Go packages, and gokm supplies all the
 kernel-side code. Goroutines, channels, `sync`, `fmt`, maps, `defer`/`recover`
 and floating point all work, and Go code runs on all CPUs in parallel.
+
+**New to gokm?** [TUTORIAL.md](TUTORIAL.md) walks you through building,
+loading and extending a "hello world" kernel module in a few minutes.
 
 ```sh
 gokm init hello          # creates hello/go.mod and hello/main.go
