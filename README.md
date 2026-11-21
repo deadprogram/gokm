@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/gopher-tux.png" alt="The Go gopher in a Tux costume" width="240">
+</p>
+
 # gokm — Go Kernel Modules
 
 > [!WARNING]
@@ -376,3 +380,10 @@ runtime C (shim, threads, heap) + framework glue + generated wrappers + go.o ─
 make test     # go vet + unit tests (BTF parsing and binding generation use the running kernel's BTF)
 make qemu     # build every example and fixture and run each in a QEMU VM with its test program
 ```
+
+## Mascot
+
+The gokm mascot is the Go gopher dressed as Tux, the Linux penguin
+created by Larry Ewing. It's based on the Go gopher designed by
+[Renée French](https://reneefrench.blogspot.com/), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
