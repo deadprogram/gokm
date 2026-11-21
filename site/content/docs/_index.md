@@ -37,3 +37,13 @@ and floating point all work, and Go code runs on all CPUs in parallel.
 - [How it works](/docs/internals/): the build pipeline and the runtime.
 - [Limitations](/docs/limitations/): what isn't supported.
 - [Development](/docs/development/): building gokm itself and running its tests.
+
+## License
+
+gokm is released under the [MIT License](https://github.com/jespino/gokm/blob/main/LICENSE),
+except the C code it compiles into every module (its runtime, the framework
+glue and the C files it generates) and `examples/gobrd`, a port of Linux's
+brd driver: those are under the
+[GPL-2.0](https://github.com/jespino/gokm/blob/main/LICENSES/GPL-2.0.txt), as their
+`SPDX-License-Identifier` headers say. That C code uses GPL-only kernel
+symbols, so modules built with gokm need a GPL-compatible `MODULE_LICENSE`.

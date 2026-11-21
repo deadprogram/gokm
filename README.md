@@ -81,6 +81,20 @@ make test     # go vet + unit tests (BTF parsing and binding generation use the 
 make qemu     # build every example and fixture and run each in a QEMU VM with its test program
 ```
 
+## License
+
+gokm is released under the [MIT License](LICENSE), except:
+
+- The C code that gokm compiles into every module (the runtime in
+  `internal/assets/_files/kmod/`, the framework glue in
+  `internal/assets/_files/frameworks/`, and the C files gokm generates) is
+  under the [GPL-2.0](LICENSES/GPL-2.0.txt), as its
+  `SPDX-License-Identifier` headers say. It uses GPL-only kernel symbols,
+  which is also why modules built with gokm need a GPL-compatible
+  `MODULE_LICENSE` (`-license`).
+- `examples/gobrd/main.go` is a port of Linux's `drivers/block/brd.c` and is
+  under the GPL-2.0.
+
 ## Mascot
 
 The gokm mascot is the Go gopher dressed as Tux, the Linux penguin

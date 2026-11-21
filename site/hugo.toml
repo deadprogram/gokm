@@ -1,6 +1,6 @@
 baseURL = "https://jespino.github.io/gokm/"
 title = "gokm"
-locale = "en"
+locale = "en-US"
 theme = "gopherdocs"
 disableKinds = ["taxonomy", "term", "rss"]
 enableRobotsTXT = true
@@ -12,10 +12,12 @@ enableRobotsTXT = true
   contentPath = "site/content"
   badge = "experimental"
   mascot = "img/gopher-tux.png"
+  socialImage = "img/social.png"
   mascotAlt = "The Go gopher in a Tux costume"
   accent = "#a85d00"
   accentDark = "#f2b84b"
   sidebar = ["/docs", "/api"]
+  license = "Released under the [MIT License](https://github.com/jespino/gokm/blob/main/LICENSE), except the C code compiled into modules and `examples/gobrd`, which are [GPL-2.0](https://github.com/jespino/gokm/blob/main/LICENSES/GPL-2.0.txt)."
   footer = "The mascot is based on the Go gopher by [Renée French](https://reneefrench.blogspot.com/) ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)), dressed as Tux, the Linux penguin by Larry Ewing."
 
 [[menus.main]]

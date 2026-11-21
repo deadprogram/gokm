@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0
+
 // gobrd is a RAM-backed block device: a Go port of Linux's brd
 // (drivers/block/brd.c).
 //
