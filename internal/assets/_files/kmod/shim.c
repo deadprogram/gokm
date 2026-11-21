@@ -63,11 +63,12 @@ void tinygo_scanCurrentStack(void)
 
 /*
  * tinygo_longjmp(frame) resumes at a deferred-call landing pad after a
- * recovered panic: frame holds {jumpSP, jumpPC}. TinyGo's own version ends in
- * an indirect `jmp *%rax`; the landing pad has no endbr64, so under IBT that
- * faults. Pushing the target and leaving through the return thunk (how every
+ * recovered panic: frame holds {jumpSP, jumpPC, frame pointer}. TinyGo's own
+ * version (src/runtime/asm_amd64.S) ends in an indirect `jmp *%rax`; the
+ * landing pad has no endbr64, so under IBT that faults. Pushing the target and leaving through the return thunk (how every
  * RETHUNK function returns) isn't subject to IBT. rax must be non-zero at
- * the landing pad, which the target address guarantees.
+ * the landing pad, which the target address guarantees. TinyGo before 0.45
+ * lists rbp as clobbered by setjmp, so restoring it is harmless there.
  */
 void tinygo_longjmp(void *frame);
 asm(".pushsection .text.tinygo_longjmp, \"ax\"\n"
@@ -76,6 +77,7 @@ asm(".pushsection .text.tinygo_longjmp, \"ax\"\n"
     "tinygo_longjmp:\n"
     "\tendbr64\n"
     "\tmovq 0(%rdi), %rsp\n"
+    "\tmovq 16(%rdi), %rbp\n"
     "\tmovq 8(%rdi), %rax\n"
     "\tpushq %rax\n"
     "\tjmp __x86_return_thunk\n"
