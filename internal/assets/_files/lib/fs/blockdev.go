@@ -156,7 +156,8 @@ func timeOf(ns int64) *time.Time {
 
 //export gokm_fs_go_statfs
 func goStatfs(h uintptr, bsize, blocks, bfree, bavail, files, ffree, namelen *int64) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	s, ok := getMount(h).root.(Statfser)
 	if !ok {
 		return -int(kernel.ENOSYS)
@@ -172,7 +173,8 @@ func goStatfs(h uintptr, bsize, blocks, bfree, bavail, files, ffree, namelen *in
 
 //export gokm_fs_go_sync
 func goSync(h uintptr) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	if s, ok := getMount(h).root.(Syncer); ok {
 		return kernel.ToErrno(s.Sync())
 	}
@@ -181,7 +183,8 @@ func goSync(h uintptr) (rc int) {
 
 //export gokm_fs_go_settimes
 func goSetTimes(h uintptr, ino uint64, atime, mtime int64) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int(kernel.ENOENT)

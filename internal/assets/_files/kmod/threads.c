@@ -13,8 +13,9 @@
  * the work instead; spinning there could deadlock against the collector).
  *
  * Thread records. Every task with Go frames on its stack has a
- * struct gokm_thread on gokm_threads, living in the frame of its outermost
- * entry, so it's inside the stack range the collector scans (it holds the
+ * struct gokm_thread in gokm_threads (hashed by task), living in the frame
+ * of its outermost entry, so it's inside the stack range the collector
+ * scans (it holds the
  * Go task.Task, whose fields may point into the heap). A task not running
  * Go but with Go frames is *parked*: it recorded its stack pointer and
  * callee-saved registers, and the collector scans from there to the top.
@@ -96,42 +97,55 @@ static void gate_exit(struct gokm_thread *t)
 
 /* ---- Thread records --------------------------------------------------- */
 
-static LIST_HEAD(gokm_threads);
-static DEFINE_SPINLOCK(gokm_threads_lock);
+#define GOKM_THREAD_BITS 8
+
+/* Records hashed by task, so concurrent tasks don't share a lock. */
+static struct gokm_thread_bucket {
+	spinlock_t lock;
+	struct list_head threads;
+} gokm_threads[1 << GOKM_THREAD_BITS];
 static DEFINE_PER_CPU(struct gokm_thread, gokm_atomic_thread);
+
+static struct gokm_thread_bucket *thread_bucket(struct task_struct *tsk)
+{
+	return &gokm_threads[hash_ptr(tsk, GOKM_THREAD_BITS)];
+}
 
 static struct gokm_thread *find_thread(struct task_struct *tsk)
 {
+	struct gokm_thread_bucket *b = thread_bucket(tsk);
 	struct gokm_thread *t, *found = NULL;
 	unsigned long flags;
 
-	spin_lock_irqsave(&gokm_threads_lock, flags);
-	list_for_each_entry(t, &gokm_threads, list) {
+	spin_lock_irqsave(&b->lock, flags);
+	list_for_each_entry(t, &b->threads, list) {
 		if (t->task == tsk) {
 			found = t;
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&gokm_threads_lock, flags);
+	spin_unlock_irqrestore(&b->lock, flags);
 	return found;
 }
 
 static void add_thread(struct gokm_thread *t)
 {
+	struct gokm_thread_bucket *b = thread_bucket(t->task);
 	unsigned long flags;
 
-	spin_lock_irqsave(&gokm_threads_lock, flags);
-	list_add(&t->list, &gokm_threads);
-	spin_unlock_irqrestore(&gokm_threads_lock, flags);
+	spin_lock_irqsave(&b->lock, flags);
+	list_add(&t->list, &b->threads);
+	spin_unlock_irqrestore(&b->lock, flags);
 }
 
 static void del_thread(struct gokm_thread *t)
 {
+	struct gokm_thread_bucket *b = thread_bucket(t->task);
 	unsigned long flags;
 
-	spin_lock_irqsave(&gokm_threads_lock, flags);
+	spin_lock_irqsave(&b->lock, flags);
 	list_del(&t->list);
-	spin_unlock_irqrestore(&gokm_threads_lock, flags);
+	spin_unlock_irqrestore(&b->lock, flags);
 }
 
 /* The record of the code running right now: an atomic entry on this CPU,
@@ -331,18 +345,21 @@ void gokm_scan_stacks(void)
 {
 	struct gokm_thread *t;
 	unsigned long regs[6];
+	int i;
 
 	SPILL_REGS(regs);
 	tinygo_scanstack((unsigned long)regs);
 
-	/* Other tasks can't change the list: they'd need to be active. */
-	list_for_each_entry(t, &gokm_threads, list) {
-		if (t->active)
-			continue;	/* us */
-		tinygo_kmod_markrange((unsigned long)t->regs,
-				      (unsigned long)(t->regs + ARRAY_SIZE(t->regs)));
-		if (t->park_sp && t->park_sp < t->top)
-			tinygo_kmod_markrange(t->park_sp, t->top);
+	/* Other tasks can't change the lists: they'd need to be active. */
+	for (i = 0; i < ARRAY_SIZE(gokm_threads); i++) {
+		list_for_each_entry(t, &gokm_threads[i].threads, list) {
+			if (t->active)
+				continue;	/* us */
+			tinygo_kmod_markrange((unsigned long)t->regs,
+					      (unsigned long)(t->regs + ARRAY_SIZE(t->regs)));
+			if (t->park_sp && t->park_sp < t->top)
+				tinygo_kmod_markrange(t->park_sp, t->top);
+		}
 	}
 	asm volatile("" : : "r"(regs) : "memory");	/* keep regs live */
 }
@@ -618,6 +635,10 @@ void gokm_threads_init(void)
 	for (i = 0; i < ARRAY_SIZE(gokm_futex); i++) {
 		spin_lock_init(&gokm_futex[i].lock);
 		INIT_LIST_HEAD(&gokm_futex[i].waiters);
+	}
+	for (i = 0; i < ARRAY_SIZE(gokm_threads); i++) {
+		spin_lock_init(&gokm_threads[i].lock);
+		INIT_LIST_HEAD(&gokm_threads[i].threads);
 	}
 }
 

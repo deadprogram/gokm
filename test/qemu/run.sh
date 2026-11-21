@@ -8,6 +8,7 @@
 #   TEST_PROG=dir               Go main package (built with the regular Go
 #                               toolchain) to run in the VM after loading
 #   EXPECT_LOAD_ERRNO=ENODEV    expect loading to fail with this errno
+#   SMP=2                       number of CPUs of the VM
 #   KERNEL=/boot/vmlinuz-linux  kernel image to boot (must match the kernel
 #                               the module was built for)
 #   EXTRA_MODULES="drivers/block/brd.ko.zst ..."
@@ -48,7 +49,7 @@ if [ -w /dev/kvm ]; then
 fi
 
 # panic=-1 + -no-reboot: a kernel panic exits QEMU instead of hanging.
-timeout 120 qemu-system-x86_64 $ACCEL -m 512 -smp 2 \
+timeout 120 qemu-system-x86_64 $ACCEL -m 512 -smp ${SMP:-2} \
 	-kernel "$KERNEL" -initrd "$WORK/initramfs.cpio.gz" \
 	-append "console=ttyS0 loglevel=7 panic=-1 oops=panic" \
 	-nographic -no-reboot

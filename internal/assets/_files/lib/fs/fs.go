@@ -293,7 +293,8 @@ func viewBytes(p *byte, n int) []byte {
 
 //export gokm_fs_go_mount
 func goMount(fsHandle, sb uintptr, blockSize int, size int64, readOnly bool, out *uintptr) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	f := kernel.Handle(fsHandle).Value().(*FileSystem)
 	var root Dir
 	var err error
@@ -333,7 +334,8 @@ func goRelease(h uintptr) {
 
 //export gokm_fs_go_stat
 func goStat(h uintptr, ino uint64, mode *uint32, size, atime, mtime, ctime *int64) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int(kernel.ENOENT)
@@ -358,7 +360,8 @@ func goStat(h uintptr, ino uint64, mode *uint32, size, atime, mtime, ctime *int6
 //
 //export gokm_fs_go_lookup
 func goLookup(h uintptr, dirIno uint64, name *byte, nameLen int) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	m := getMount(h)
 	d, errno := m.dir(dirIno)
 	if errno != 0 {
@@ -376,7 +379,8 @@ func goLookup(h uintptr, dirIno uint64, name *byte, nameLen int) (rc int64) {
 
 //export gokm_fs_go_create
 func goCreate(h uintptr, dirIno uint64, name *byte, nameLen int, mode uint32) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	m := getMount(h)
 	d, errno := m.dir(dirIno)
 	if errno != 0 {
@@ -413,7 +417,8 @@ func goCreate(h uintptr, dirIno uint64, name *byte, nameLen int, mode uint32) (r
 
 //export gokm_fs_go_remove
 func goRemove(h uintptr, dirIno uint64, name *byte, nameLen int, isDir bool) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	m := getMount(h)
 	d, errno := m.dir(dirIno)
 	if errno != 0 {
@@ -446,7 +451,8 @@ func goRemove(h uintptr, dirIno uint64, name *byte, nameLen int, isDir bool) (rc
 //
 //export gokm_fs_go_rename
 func goRename(h uintptr, oldDirIno uint64, oldName *byte, oldLen int, newDirIno uint64, newName *byte, newLen int) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	m := getMount(h)
 	od, errno := m.dir(oldDirIno)
 	if errno != 0 {
@@ -476,7 +482,8 @@ func goRename(h uintptr, oldDirIno uint64, oldName *byte, oldLen int, newDirIno 
 
 //export gokm_fs_go_symlink
 func goSymlink(h uintptr, dirIno uint64, name *byte, nameLen int, target *byte, targetLen int) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	m := getMount(h)
 	d, errno := m.dir(dirIno)
 	if errno != 0 {
@@ -501,7 +508,8 @@ func goSymlink(h uintptr, dirIno uint64, name *byte, nameLen int, target *byte, 
 //
 //export gokm_fs_go_readlink
 func goReadlink(h uintptr, ino uint64, buf **byte, n *int) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	node, ok := getMount(h).node(ino)
 	if !ok {
 		return -int(kernel.ENOENT)
@@ -535,7 +543,8 @@ func goEvict(h uintptr, ino uint64) {
 
 //export gokm_fs_go_read
 func goRead(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int64(kernel.ENOENT)
@@ -553,7 +562,8 @@ func goRead(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) {
 
 //export gokm_fs_go_write
 func goWrite(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int64(kernel.ENOENT)
@@ -571,7 +581,8 @@ func goWrite(h uintptr, ino uint64, buf *byte, count int, off int64) (rc int64) 
 
 //export gokm_fs_go_truncate
 func goTruncate(h uintptr, ino uint64, size int64) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	n, ok := getMount(h).node(ino)
 	if !ok {
 		return -int(kernel.ENOENT)
@@ -588,7 +599,8 @@ func goTruncate(h uintptr, ino uint64, size int64) (rc int) {
 //
 //export gokm_fs_go_iterate
 func goIterate(h uintptr, dirIno uint64, start int64, ctx uintptr) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	m := getMount(h)
 	d, errno := m.dir(dirIno)
 	if errno != 0 {
@@ -632,7 +644,8 @@ func xattrer(h uintptr, ino uint64) (Xattrer, int) {
 //
 //export gokm_fs_go_getxattr
 func goGetxattr(h uintptr, ino uint64, name *byte, nameLen int, buf *byte, size int) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	x, errno := xattrer(h, ino)
 	if errno != 0 {
 		if errno == -int(kernel.EOPNOTSUPP) {
@@ -657,7 +670,8 @@ func goGetxattr(h uintptr, ino uint64, name *byte, nameLen int, buf *byte, size 
 //export gokm_fs_go_setxattr
 func goSetxattr(h uintptr, ino uint64, name *byte, nameLen int, value *byte, size int,
 	remove bool, flags int32) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	x, errno := xattrer(h, ino)
 	if errno != 0 {
 		return errno
@@ -689,7 +703,8 @@ func goSetxattr(h uintptr, ino uint64, name *byte, nameLen int, value *byte, siz
 //
 //export gokm_fs_go_listxattr
 func goListxattr(h uintptr, ino uint64, buf *byte, size int) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	x, errno := xattrer(h, ino)
 	if errno != 0 {
 		if errno == -int(kernel.EOPNOTSUPP) {

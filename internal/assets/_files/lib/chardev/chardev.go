@@ -255,7 +255,8 @@ func view(p *byte, n int) []byte {
 
 //export gokm_chardev_go_open
 func goOpen(h uintptr, out *uintptr) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	d := kernel.Handle(h).Value().(*Device)
 	f, err := d.Opener.Open()
 	if err != nil {
@@ -269,7 +270,8 @@ func file(h uintptr) File { return *kernel.Handle(h).Value().(*File) }
 
 //export gokm_chardev_go_read
 func goRead(h uintptr, buf *byte, count int, off int64, flags uint32) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	var n int
 	var err error
 	switch r := file(h).(type) {
@@ -288,7 +290,8 @@ func goRead(h uintptr, buf *byte, count int, off int64, flags uint32) (rc int64)
 
 //export gokm_chardev_go_write
 func goWrite(h uintptr, buf *byte, count int, off int64, flags uint32) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	var n int
 	var err error
 	switch w := file(h).(type) {
@@ -307,7 +310,8 @@ func goWrite(h uintptr, buf *byte, count int, off int64, flags uint32) (rc int64
 
 //export gokm_chardev_go_ioctl
 func goIoctl(h uintptr, cmd uint32, arg uintptr) (rc int64) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int64(kernel.EIO)
+	defer kernel.CatchPanic[int64](nil)
 	io, ok := file(h).(Ioctler)
 	if !ok {
 		return -int64(kernel.ENOTTY)
@@ -321,7 +325,8 @@ func goIoctl(h uintptr, cmd uint32, arg uintptr) (rc int64) {
 
 //export gokm_chardev_go_poll
 func goPoll(h uintptr) (rc int32) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int32(kernel.EIO)
+	defer kernel.CatchPanic[int32](nil)
 	if p, ok := file(h).(Poller); ok {
 		return int32(p.Poll())
 	}

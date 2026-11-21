@@ -153,7 +153,8 @@ func disk(h uintptr) *Disk { return kernel.Handle(h).Value().(*Disk) }
 
 //export gokm_blk_go_rw
 func goRW(h uintptr, write bool, buf *byte, n int, off int64) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	d := disk(h)
 	p := unsafe.Slice(buf, n)
 	var err error
@@ -167,7 +168,8 @@ func goRW(h uintptr, write bool, buf *byte, n int, off int64) (rc int) {
 
 //export gokm_blk_go_flush
 func goFlush(h uintptr) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	if f, ok := disk(h).Device.(Flusher); ok {
 		return kernel.ToErrno(f.Flush())
 	}
@@ -176,7 +178,8 @@ func goFlush(h uintptr) (rc int) {
 
 //export gokm_blk_go_discard
 func goDiscard(h uintptr, off, n int64) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	if dc, ok := disk(h).Device.(Discarder); ok {
 		return kernel.ToErrno(dc.Discard(off, n))
 	}

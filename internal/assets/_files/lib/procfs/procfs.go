@@ -88,7 +88,8 @@ func (f *File) Remove() {
 //
 //export gokm_procfs_go_open
 func goOpen(h uintptr, buf **byte, n *int) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	f := kernel.Handle(h).Value().(*File)
 	data, err := f.handler.Read()
 	if err != nil {
@@ -103,7 +104,8 @@ func goOpen(h uintptr, buf **byte, n *int) (rc int) {
 
 //export gokm_procfs_go_write
 func goWrite(h uintptr, buf *byte, n int) (rc int) {
-	defer kernel.CatchPanic(&rc)
+	rc = -int(kernel.EIO)
+	defer kernel.CatchPanic[int](nil)
 	f := kernel.Handle(h).Value().(*File)
 	w, ok := f.handler.(Writer)
 	if !ok {
